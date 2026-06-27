@@ -17,7 +17,204 @@
 const SHARED_TRIGGER_SCRIPT = `const validators = cluster.getAgentsByRole('validator');
 const lastPush = ledger.findLast({ topic: 'IMPLEMENTATION_READY' });
 if (!lastPush) return false;
-if (validators.length === 0) return true;
+
+function isApproved(value) {
+  return value === true || value === 'true';
+}
+
+function getPayload(msg) {
+  return msg?.content?.['data'] || {};
+}
+
+function getEvidence(gate) {
+  return gate?.evidence && typeof gate.evidence === 'object' ? gate.evidence : {};
+}
+
+function getGateId(gate) {
+  if (typeof gate?.id === 'string' && gate.id.trim() !== '') return gate.id.trim();
+  const gateName = gate?.['name'];
+  if (typeof gateName === 'string' && gateName.trim() !== '') return gateName.trim();
+  return null;
+}
+
+function normalizeGateRequirements(value) {
+  if (!Array.isArray(value)) return [];
+  const normalized = [];
+  for (const gate of value) {
+    if (typeof gate === 'string') {
+      const id = gate.trim();
+      if (id) normalized.push({ id });
+      continue;
+    }
+    if (!gate || typeof gate !== 'object') continue;
+    const id = getGateId(gate);
+    if (!id) continue;
+    const required = { id };
+    if (typeof gate.scope === 'string' && gate.scope.trim() !== '') {
+      required.scope = gate.scope.trim();
+    }
+    normalized.push(required);
+  }
+  return normalized;
+}
+
+function getRequiredQualityGates() {
+  const currentAgent =
+    typeof cluster.getAgent === 'function' ? cluster.getAgent(agent.id) : null;
+  const sources = [
+    agent.requiredQualityGates,
+    currentAgent?.requiredQualityGates,
+    currentAgent?.config?.requiredQualityGates,
+  ];
+  for (const source of sources) {
+    const gates = normalizeGateRequirements(source);
+    if (gates.length > 0) return gates;
+  }
+  return [];
+}
+
+function collectQualityGates(msg) {
+  const gateData = getPayload(msg);
+  return Array.isArray(gateData.qualityGates) ? gateData.qualityGates : [];
+}
+
+function toTimestamp(timestampInput) {
+  const value = timestampInput;
+  if (typeof value === 'number' && isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const numeric = Number(value);
+    if (isFinite(numeric)) return numeric;
+    const parsed = Date.parse(value);
+    if (isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function qualityGateTimestamp(gate, msg) {
+  const evidence = getEvidence(gate);
+  return (
+    toTimestamp(gate?.timestamp) ||
+    toTimestamp(gate?.validatedAt) ||
+    toTimestamp(gate?.completedAt) ||
+    toTimestamp(evidence.timestamp) ||
+    toTimestamp(evidence.validatedAt) ||
+    toTimestamp(evidence.completedAt)
+  );
+}
+
+function describeQualityGate(gate, msg, required) {
+  const evidence = getEvidence(gate);
+  const parts = [];
+  const gateId = getGateId(gate) || required?.id;
+  const scope = gate?.scope || evidence.scope || required?.scope;
+  const status = gate?.status;
+  const exitCode = evidence.exitCode;
+  const command = evidence.command;
+  const output = evidence.output || gate?.reason || evidence.reason;
+  if (gateId) parts.push('gate=' + gateId);
+  if (scope) parts.push('scope=' + scope);
+  if (status) parts.push('status=' + status);
+  if (exitCode !== undefined) parts.push('exitCode=' + exitCode);
+  if (command) parts.push('command=' + JSON.stringify(String(command).slice(0, 160)));
+  if (msg?.sender) parts.push('sender=' + msg.sender);
+  if (output) parts.push('output=' + JSON.stringify(String(output).slice(0, 240)));
+  if (!output && (gate?.reason || evidence.reason)) {
+    parts.push('reason=' + JSON.stringify(String(gate?.reason || evidence.reason).slice(0, 240)));
+  }
+  return parts.join(' ');
+}
+
+function exitCodePasses(evidence) {
+  const exitCode = evidence.exitCode;
+  return (
+    exitCode === 0 ||
+    exitCode === '0' ||
+    (typeof exitCode === 'string' && exitCode.trim() !== '' && Number(exitCode) === 0)
+  );
+}
+
+function qualityGateMatches(gate, required) {
+  if (getGateId(gate) !== required.id) return false;
+  if (required.scope && gate?.scope !== required.scope && getEvidence(gate).scope !== required.scope) {
+    return false;
+  }
+  return true;
+}
+
+function compareGateEvidence(left, right) {
+  const leftTimestamp = qualityGateTimestamp(left.gate, left.msg) || 0;
+  const rightTimestamp = qualityGateTimestamp(right.gate, right.msg) || 0;
+  return leftTimestamp - rightTimestamp;
+}
+
+function findLatestQualityGate(messages, required) {
+  let latest = null;
+  for (const msg of messages) {
+    for (const gate of collectQualityGates(msg)) {
+      if (!qualityGateMatches(gate, required)) continue;
+      const candidate = { gate, msg };
+      if (!latest || compareGateEvidence(candidate, latest) >= 0) {
+        latest = candidate;
+      }
+    }
+  }
+  return latest;
+}
+
+function getQualityGateBlockingReasons(gate, msg) {
+  const reasons = [];
+  const status = String(gate?.status || '').toUpperCase();
+  if (status !== 'PASS') reasons.push('status=' + (gate?.status || 'missing'));
+
+  const evidence = getEvidence(gate);
+  if (typeof evidence.command !== 'string' || evidence.command.trim() === '') {
+    reasons.push('missing evidence.command');
+  }
+  if (!exitCodePasses(evidence)) {
+    reasons.push('evidence.exitCode=' + evidence.exitCode);
+  }
+  if (typeof evidence.output !== 'string') {
+    reasons.push('missing evidence.output');
+  }
+  if (gate?.stale === true || evidence.stale === true) {
+    reasons.push('stale=true');
+  }
+  const completedAt = qualityGateTimestamp(gate, msg);
+  if (completedAt === null) {
+    reasons.push('missing completedAt');
+  } else if (completedAt < lastPush.timestamp) {
+    reasons.push('completed before IMPLEMENTATION_READY');
+  }
+  return reasons;
+}
+
+function assertRequiredQualityGatesPass(messages) {
+  if (requiredQualityGatesForHandoff.length === 0) return true;
+
+  for (const required of requiredQualityGatesForHandoff) {
+    const found = findLatestQualityGate(messages, required);
+    if (!found) {
+      throw new Error(
+        'Required quality gate missing for git-pusher handoff: gate=' + required.id
+      );
+    }
+
+    const reasons = getQualityGateBlockingReasons(found.gate, found.msg);
+    if (reasons.length > 0) {
+      throw new Error(
+        'Required quality gate blocked git-pusher handoff: ' +
+          describeQualityGate(found.gate, found.msg, required) +
+          ' reason=' +
+          JSON.stringify(reasons.join(', '))
+      );
+    }
+  }
+
+  return true;
+}
+
+const requiredQualityGatesForHandoff = getRequiredQualityGates();
+if (validators.length === 0 && requiredQualityGatesForHandoff.length === 0) return true;
 
 const results = ledger.query({ topic: 'VALIDATION_RESULT', since: lastPush.timestamp });
 if (results.length === 0) return false;
@@ -27,7 +224,7 @@ const validatorResults = results.filter((r) => validatorIds.has(r.sender));
 
 // Two supported patterns:
 // 1) Per-validator VALIDATION_RESULT (sender is a validator) → require all validators approve.
-// 2) Consensus-only VALIDATION_RESULT (sender is coordinator) → treat latest result as final.
+// 2) Consensus-only VALIDATION_RESULT (sender is coordinator) -> use latest result.
 if (validatorResults.length === 0) {
   let latest = null;
   for (const msg of results) {
@@ -35,8 +232,10 @@ if (validatorResults.length === 0) {
       latest = msg;
     }
   }
-  const approved = latest?.content?.data?.approved;
-  return approved === true || approved === 'true';
+  const approved = getPayload(latest).approved;
+  if (!isApproved(approved)) return false;
+  assertRequiredQualityGatesPass([latest]);
+  return true;
 }
 
 const latestByValidator = new Map();
@@ -47,12 +246,15 @@ if (latestByValidator.size < validators.length) return false;
 
 for (const validator of validators) {
   const msg = latestByValidator.get(validator.id);
-  const approved = msg?.content?.data?.approved;
-  if (!(approved === true || approved === 'true')) return false;
+  const approved = getPayload(msg).approved;
+  if (!isApproved(approved)) return false;
 }
 
-const hasSufficientEvidence = Array.from(latestByValidator.values()).every((r) => {
-  const criteria = r.content?.data?.criteriaResults;
+const latestValidatorMessages = Array.from(latestByValidator.values());
+assertRequiredQualityGatesPass(latestValidatorMessages);
+
+const hasSufficientEvidence = latestValidatorMessages.every((r) => {
+  const criteria = getPayload(r).criteriaResults;
   if (!Array.isArray(criteria) || criteria.length === 0) return true;
   return criteria.every((c) => {
     const status = String(c.status || '').toUpperCase();
@@ -64,7 +266,7 @@ const hasSufficientEvidence = Array.from(latestByValidator.values()).every((r) =
     const exitCode = evidence.exitCode;
     const hasExitCode =
       typeof exitCode === 'number' ||
-      (typeof exitCode === 'string' && exitCode.trim() !== '' && Number.isFinite(Number(exitCode)));
+      (typeof exitCode === 'string' && exitCode.trim() !== '' && isFinite(Number(exitCode)));
     const hasOutput = evidence.output === undefined || typeof evidence.output === 'string';
     return hasCommand && hasExitCode && hasOutput;
   });
@@ -73,6 +275,7 @@ const hasSufficientEvidence = Array.from(latestByValidator.values()).every((r) =
 return hasSufficientEvidence;`;
 
 const { readRepoSettings } = require('../../lib/repo-settings');
+const { resolveRequiredQualityGates } = require('../quality-gates');
 
 function getSafeBranchName(value) {
   if (typeof value !== 'string') {
@@ -121,7 +324,7 @@ function normalizeCloseIssueMode(value) {
  * @returns {Object} Resolved configuration
  */
 function resolveGitHubConfig(options = {}) {
-  const repoSettingsResult = readRepoSettings(process.cwd());
+  const repoSettingsResult = readRepoSettings(options.cwd || process.cwd());
   const repoSettings = repoSettingsResult.settings || {};
   const repoGithub = repoSettings.github || {};
 
@@ -157,14 +360,14 @@ function getPlatformConfig(platform, config = {}) {
       prNameLower: 'pull request',
       createCmd: `gh pr create${prBase ? ` --base ${prBase}` : ''} --title "feat: {{issue_title}}" --body "Closes #{{issue_number}}"`,
       mergeCmd: useMergeQueue
-        ? `PR_ID="$(gh pr view --json id --jq .id)"
+        ? `PR_ID="$(timeout 30 gh pr view --json id --jq .id)"
 gh api graphql -f query='mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){mergeQueueEntry{state}}}' -f id="$PR_ID"
 echo "Waiting for merge..."
-until gh pr view --json mergedAt --jq .mergedAt | grep -q .; do
-  sleep 20
-done`
-        : 'gh pr merge --merge --auto',
-      mergeFallbackCmd: useMergeQueue ? 'gh pr merge --merge --auto' : 'gh pr merge --merge',
+for i in $(seq 1 90); do if timeout 30 gh pr view --json mergedAt --jq .mergedAt | grep -q .; then break; fi; sleep 20; done`
+        : 'gh pr merge --merge --delete-branch',
+      mergeFallbackCmd: useMergeQueue
+        ? 'gh pr merge --merge --delete-branch'
+        : 'gh pr merge --merge',
       prUrlExample: 'https://github.com/owner/repo/pull/123',
       outputFields: { urlField: 'pr_url', numberField: 'pr_number', mergedField: 'merged' },
       rebaseBranch: prBase || 'main',
@@ -231,84 +434,107 @@ function generatePrompt(config) {
     closeIssueMode,
   } = config;
 
+  // Azure-specific instructions for PR ID extraction
   const azurePrIdNote = requiresPrIdExtraction
-    ? `\n\nOutput contains PR ID. Extract it for step 6 — look for "Created PR 123" or parse URL.`
+    ? `\n\n💡 IMPORTANT: The output will contain the PR ID. You MUST extract it for the next step.
+Look for output like: "Created PR 123" or parse the URL for the PR number.
+Save the PR ID to a variable for step 6.`
     : '';
 
+  // Azure uses different merge terminology
   const mergeDescription = requiresPrIdExtraction
-    ? 'SET AUTO-COMPLETE'
+    ? 'SET AUTO-COMPLETE (MANDATORY - THIS IS NOT OPTIONAL)'
     : usesMergeQueue
-      ? `ENQUEUE INTO MERGE QUEUE AND WAIT UNTIL MERGED`
-      : `MERGE THE ${prName}`;
+      ? `ENQUEUE INTO MERGE QUEUE AND WAIT UNTIL THE ${prName} IS MERGED (MANDATORY - THIS IS NOT OPTIONAL)`
+      : `MERGE THE ${prName} (MANDATORY - THIS IS NOT OPTIONAL)`;
 
   const mergeExplanation = requiresPrIdExtraction
-    ? `Replace <PR_ID> with actual PR number from step 5. Enables auto-complete (merges when CI passes).
+    ? `Replace <PR_ID> with the actual PR number from step 5.
+This enables auto-complete (auto-merge when CI passes).
 
-If auto-complete unavailable:`
+If auto-complete is not available or you need to merge immediately:`
     : usesMergeQueue
-      ? `Enqueues ${prName} into merge queue and waits until merged.
+      ? `This enqueues the ${prName} into GitHub's merge queue and waits until it is merged.
 
-If enqueue fails, fall back:`
-      : `Sets auto-merge. If it fails, try:`;
-
-  const postMergeStatus = requiresPrIdExtraction
-    ? 'PR IS CREATED AND AUTO-COMPLETE IS SET'
-    : `${prName} IS MERGED`;
+If enqueue fails (merge queue not enabled, missing permissions, etc.), fall back to auto-merge:`
+      : `This merges the ${prName} directly and deletes the remote branch. If it fails, try without branch deletion:`;
 
   const finalOutputNote = requiresPrIdExtraction
-    ? `ONLY after PR created and auto-complete set:
+    ? `ONLY after the PR is created and auto-complete is set, output:
 \`\`\`json
 {"${outputFields.urlField}": "${prUrlExample}", "${outputFields.numberField}": 123, "merged": false, "auto_complete": true}
 \`\`\`
 
-No changes:
+If truly no changes exist, output:
 \`\`\`json
 {"${outputFields.urlField}": null, "${outputFields.numberField}": null, "merged": false, "auto_complete": false}
 \`\`\``
-    : `ONLY after ${prName} is MERGED:
+    : `ONLY after the ${prName} is MERGED, output:
 \`\`\`json
 {"${outputFields.urlField}": "${prUrlExample}", "${outputFields.numberField}": 123, "merged": true}
 \`\`\`
 
-No changes:
+If truly no changes exist, output:
 \`\`\`json
 {"${outputFields.urlField}": null, "${outputFields.numberField}": null, "merged": false}
 \`\`\``;
 
-  return `ALL VALIDATORS APPROVED. Create ${prName} and merge. Do not stop until ${postMergeStatus}.
+  return `CRITICAL: ALL VALIDATORS APPROVED. YOU ARE A TRANSPORT-ONLY GIT PUSHER.
 
-## Steps — execute in order
+Your job is to preserve validator ownership: stage, commit, push, create the ${prName}, then merge or enable auto-merge when possible.
 
-### 1: Stage changes
+Do NOT edit source files, tests, configs, generated artifacts, or lockfiles.
+Do NOT inspect CI logs to debug product code.
+Do NOT resolve merge conflicts or rebase conflicts.
+Do NOT run implementation/debugging workflows after validators hand off.
+
+Allowed after validation:
+- git add/status/commit/push
+- ${createCmd.split(' ').slice(0, 3).join(' ')}
+- ${mergeCmd.split(' ').slice(0, 4).join(' ')} or auto-merge/auto-complete commands
+- status-only commands such as ${prName === 'PR' ? 'gh pr view/gh pr checks' : 'the platform PR/MR status command'}
+
+If commit hooks, push, ${prName} creation, merge, CI, or conflict handling requires code changes, STOP and report the blocked state in JSON. The implementation and validator agents must fix code and rerun quality gates.
+
+## MANDATORY STEPS - EXECUTE EACH ONE IN ORDER - DO NOT SKIP ANY STEP
+
+### STEP 1: Stage ALL changes (MANDATORY)
 \`\`\`bash
 git add -A
 \`\`\`
+Run this command. Do not skip it. If commit fails because hooks/checks fail, do not edit files. Output blocked JSON with the failure summary.
 
-### 2: Check staged
+### STEP 2: Check what's staged
 \`\`\`bash
 git status
 \`\`\`
-Nothing to commit → output JSON with ${outputFields.urlField}: null and stop.
+Run this. If nothing to commit, output JSON with ${outputFields.urlField}: null and stop.
 
-### 3: Commit
+### STEP 3: Commit the changes (MANDATORY if there are changes)
 \`\`\`bash
 git commit -m "feat: implement #{{issue_number}} - {{issue_title}}"
 \`\`\`
+Run this command. Do not skip it.
 
-### 4: Push
+### STEP 4: Push to origin (MANDATORY)
 \`\`\`bash
 git push -u origin HEAD
 \`\`\`
-Do NOT stop here. Continue to step 5.
+Run this. If it fails, do not edit files, rebase, or resolve conflicts. Output blocked JSON with the failure summary.
 
-### 5: Create ${prName}
+⚠️ AFTER PUSH YOU ARE NOT DONE! CONTINUE TO STEP 5! ⚠️
+
+### STEP 5: CREATE THE ${prName.toUpperCase()} (MANDATORY - YOU MUST RUN THIS COMMAND)
 \`\`\`bash
 ${createCmd}
 \`\`\`
-Run \`${createCmd.split(' ').slice(0, 3).join(' ')}\`. Ignore push output link — that is NOT a ${prNameLower}.${requiresPrIdExtraction ? '' : ` Save actual ${prName} URL from output.`}${azurePrIdNote}
-Do NOT stop here. Continue to step 6.
+🚨 YOU MUST RUN \`${createCmd.split(' ').slice(0, 3).join(' ')}\`! Outputting a link is NOT creating a ${prName}! 🚨
+The push output shows a "Create a ${prNameLower}" link - IGNORE IT.
+You MUST run the \`${createCmd.split(' ').slice(0, 3).join(' ')}\` command above.${requiresPrIdExtraction ? '' : ` Save the actual ${prName} URL from the output.`}${azurePrIdNote}
 
-### 6: ${mergeDescription} (MANDATORY)
+⚠️ AFTER ${prName} CREATION YOU ARE NOT DONE! CONTINUE TO STEP 6! ⚠️
+
+### STEP 6: ${mergeDescription}
 \`\`\`bash
 ${mergeCmd}
 \`\`\`
@@ -317,17 +543,12 @@ ${mergeExplanation}
 ${mergeFallbackCmd}
 \`\`\`
 
-If merge fails due to conflicts:
-1. \`git fetch origin ${rebaseBranch || 'main'} && git rebase origin/${rebaseBranch || 'main'}\`
-2. Resolve conflicts, \`git add <resolved-files>\`, \`git rebase --continue\`
-3. \`git push --force-with-lease\`
-4. Retry: \`${mergeFallbackCmd}\`
-
-Repeat until merged. Do not give up.${requiresPrIdExtraction ? ' Auto-complete merges when CI passes.' : ' If blocked by CI, wait and retry. If blocked by reviews, set auto-merge.'}
+If direct merge is blocked by pending CI or required review, set auto-merge/auto-complete when the platform supports it and output status-only JSON without \`blocked: true\`.
+If merge is blocked by failed CI, merge conflicts, rejected hooks, or any condition requiring code changes, do not debug or edit code. Output blocked JSON with the ${prName} details and failure summary.
 
 ${
   closeIssueMode !== 'never'
-    ? `### 7: Close issue
+    ? `### STEP 7: Close the issue (MANDATORY)
 \`\`\`bash
 if [ "{{issue_number}}" != "unknown" ]; then
   ISSUE_STATE="$(gh issue view {{issue_number}} --json state --jq .state 2>/dev/null || true)"
@@ -354,13 +575,34 @@ if [ "{{issue_number}}" != "unknown" ]; then
   fi
 fi
 \`\`\`
-Only after ${prName} is merged.`
+Only do this AFTER the ${prName} is merged.`
     : ''
 }
 
-## Output
-DO NOT output JSON until ${postMergeStatus}.
-${finalOutputNote}`;
+## CRITICAL RULES
+- Execute EVERY step in order (1, 2, 3, 4, 5, 6)
+- Do NOT skip git add -A
+- Do NOT skip git commit
+- Do NOT skip ${createCmd.split(' ').slice(0, 3).join(' ')} - THE TASK IS NOT DONE UNTIL ${prName} EXISTS
+- Do NOT skip ${mergeCmd.split(' ').slice(0, 4).join(' ')} - attempt merge or auto-merge before reporting blocked${requiresPrIdExtraction ? '\n- MUST extract PR ID from step 5 output to use in step 6' : ''}
+- Do NOT edit files after validator handoff
+- Do NOT debug product failures after validator handoff
+- If push, ${prName} creation, CI, or ${requiresPrIdExtraction ? 'auto-complete' : 'merge'} fails, report it instead of fixing code
+- Output JSON only after the ${prName} is merged, auto-merge is enabled/pending, or a non-code transport failure blocks progress
+- A link from git push is NOT a ${prName} - you must run ${createCmd.split(' ').slice(0, 3).join(' ')}
+
+## Final Output
+${finalOutputNote}
+
+If blocked after creating a ${prName}, output:
+\`\`\`json
+{"${outputFields.urlField}": "${prUrlExample}", "${outputFields.numberField}": 123, "merged": false, "blocked": true, "blocked_reason": "ci_failed: test job failed"}
+\`\`\`
+
+If blocked before creating a ${prName}, output:
+\`\`\`json
+{"${outputFields.urlField}": null, "${outputFields.numberField}": null, "merged": false, "blocked": true, "blocked_reason": "commit_failed: pre-commit hook failed"}
+\`\`\``;
 }
 
 /**
@@ -371,6 +613,7 @@ ${finalOutputNote}`;
  * @param {string} [options.prBase] - Target branch for PRs
  * @param {boolean} [options.mergeQueue] - Use GitHub merge queue
  * @param {string} [options.closeIssue] - When to close issue: auto|always|never
+ * @param {Array} [options.requiredQualityGates] - Required handoff quality gates
  * @returns {Object} Agent configuration object
  * @throws {Error} If platform is not supported
  */
@@ -378,6 +621,7 @@ function generateGitPusherAgent(platform, options = {}) {
   // Resolve config from CLI options and repo settings
   const resolvedConfig = resolveGitHubConfig(options);
   const platformConfig = getPlatformConfig(platform, resolvedConfig);
+  const requiredQualityGates = resolveRequiredQualityGates(options);
 
   if (!platformConfig) {
     const supported = SUPPORTED_PLATFORMS.join(', ');
@@ -388,6 +632,7 @@ function generateGitPusherAgent(platform, options = {}) {
     id: 'git-pusher',
     role: 'completion-detector',
     modelLevel: 'level2',
+    ...(requiredQualityGates.length > 0 ? { requiredQualityGates } : {}),
     triggers: [
       {
         topic: 'VALIDATION_RESULT',
@@ -401,7 +646,7 @@ function generateGitPusherAgent(platform, options = {}) {
     prompt: generatePrompt(platformConfig),
     hooks: {
       onComplete: {
-        action: 'verify_github_pr',
+        action: 'verify_pull_request',
         // No config needed - verification reads from result.structured_output
         // and publishes CLUSTER_COMPLETE only if verification passes
       },
@@ -423,8 +668,10 @@ function generateGitPusherAgent(platform, options = {}) {
           type: 'string',
           description: 'MUST extract from gh pr merge output',
         },
+        blocked: { type: 'boolean' },
+        blocked_reason: { type: 'string' },
       },
-      required: ['pr_number', 'pr_url', 'merged', 'merge_commit_sha'],
+      required: ['pr_number', 'pr_url', 'merged'],
     },
   };
 }

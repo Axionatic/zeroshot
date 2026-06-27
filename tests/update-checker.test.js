@@ -12,6 +12,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const assert = require('assert');
+const EventEmitter = require('events');
+const childProcess = require('child_process');
 
 // Test storage directory (isolated)
 const TEST_STORAGE_DIR = path.join(os.tmpdir(), 'zeroshot-update-checker-test-' + Date.now());
@@ -141,6 +143,93 @@ describe('Update Checker', function () {
     it('should be 24 hours in milliseconds', function () {
       const expectedMs = 24 * 60 * 60 * 1000;
       assert.strictEqual(updateChecker.CHECK_INTERVAL_MS, expectedMs);
+    });
+  });
+
+  describe('install target resolution', function () {
+    it('derives a Unix npm prefix from a scoped global package root', function () {
+      const prefix = updateChecker.deriveInstallPrefixFromPackageRoot(
+        '/opt/homebrew/lib/node_modules/@covibes/zeroshot',
+        '@covibes/zeroshot'
+      );
+
+      assert.strictEqual(prefix, '/opt/homebrew');
+    });
+
+    it('derives a Unix npm prefix from the legacy scoped package root', function () {
+      const prefix = updateChecker.deriveInstallPrefixFromPackageRoot(
+        '/Users/tom/.hermes/node/lib/node_modules/@covibes/zeroshot',
+        '@covibes/zeroshot'
+      );
+
+      assert.strictEqual(prefix, '/Users/tom/.hermes/node');
+    });
+
+    it('returns null for a local development checkout', function () {
+      const prefix = updateChecker.deriveInstallPrefixFromPackageRoot(
+        '/Users/tom/code/covibes/zeroshot',
+        '@covibes/zeroshot'
+      );
+
+      assert.strictEqual(prefix, null);
+    });
+
+    it('builds install args for the install prefix', function () {
+      const args = updateChecker.buildInstallArgs({
+        installPrefix: '/tmp/prefix',
+      });
+
+      assert.deepStrictEqual(args, [
+        'install',
+        '-g',
+        '--prefix',
+        '/tmp/prefix',
+        '@covibes/zeroshot@latest',
+      ]);
+    });
+
+    it('runs npm with the resolved prefix when updating the legacy package', async function () {
+      const originalSpawn = childProcess.spawn;
+      const installPrefix = path.join(TEST_STORAGE_DIR, 'legacy-prefix');
+      fs.mkdirSync(path.join(installPrefix, 'lib', 'node_modules'), { recursive: true });
+
+      let spawnCommand = null;
+      let spawnArgs = null;
+      let spawnOptions = null;
+
+      childProcess.spawn = (command, args, options) => {
+        spawnCommand = command;
+        spawnArgs = args;
+        spawnOptions = options;
+
+        const proc = new EventEmitter();
+        process.nextTick(() => proc.emit('close', 0));
+        return proc;
+      };
+
+      try {
+        const success = await updateChecker.runUpdate({
+          packageName: '@covibes/zeroshot',
+          installPrefix,
+          npmCommand: '/tmp/npm-for-test',
+        });
+
+        assert.strictEqual(success, true);
+        assert.strictEqual(spawnCommand, '/tmp/npm-for-test');
+        assert.deepStrictEqual(spawnArgs, [
+          'install',
+          '-g',
+          '--prefix',
+          installPrefix,
+          '@covibes/zeroshot@latest',
+        ]);
+        assert.deepStrictEqual(spawnOptions, {
+          stdio: 'inherit',
+          shell: false,
+        });
+      } finally {
+        childProcess.spawn = originalSpawn;
+      }
     });
   });
 
