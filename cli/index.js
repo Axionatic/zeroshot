@@ -221,7 +221,7 @@ function runClusterPreflight({ input, options, providerOverride, settings, force
     const targetCwd = process.env.ZEROSHOT_CWD || detectGitRepoRoot();
     const result = ensureQualityConfig(targetCwd);
     if (result.created && process.env.ZEROSHOT_DAEMON !== '1') {
-      console.log(`✓ Quality gate configured: ${result.command}`);
+      console.log(`✓ Pre-validation gate configured: ${result.command}`);
       console.log('  Edit ~/.zeroshot/projects/ config, or skip with --skip-quality-gate');
     }
   }

@@ -50,7 +50,7 @@ function run() {
     const result = {
       command: null,
       exitCode: 0,
-      stdout: 'No quality gate configured — auto-passed',
+      stdout: 'No pre-validation gate configured — auto-passed',
       stderr: '',
     };
     console.log(JSON.stringify(result));

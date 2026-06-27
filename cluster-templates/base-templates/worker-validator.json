@@ -33,7 +33,7 @@
     "quality_gate": {
       "type": "boolean",
       "default": true,
-      "description": "Run automated quality checks before validation"
+      "description": "Run the pre-validation gate (automated quality checks) before validation"
     }
   },
   "agents": [
