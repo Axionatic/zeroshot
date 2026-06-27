@@ -33,12 +33,14 @@ function formatSourceMessagesSection(source, messages) {
   let context = `\n## Messages from topic: ${source.topic}\n\n`;
 
   for (const msg of messages) {
-    context += `[${new Date(msg.timestamp).toISOString()}] ${msg.sender}:\n`;
+    const d = new Date(msg.timestamp);
+    const ts = `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    context += `[${ts}] ${msg.sender}:\n`;
     if (msg.content?.text) {
       context += `${msg.content.text}\n`;
     }
     if (msg.content?.data) {
-      context += `Data: ${JSON.stringify(msg.content.data, null, 2)}\n`;
+      context += `Data: ${JSON.stringify(msg.content.data)}\n`;
     }
     context += '\n';
   }

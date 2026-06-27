@@ -52,57 +52,36 @@ function generateExampleFromSchema(schema) {
 
 function buildAutonomousSection() {
   return [
-    '## 🔴 CRITICAL: AUTONOMOUS EXECUTION REQUIRED',
+    '## AUTONOMOUS MODE',
     '',
-    'You are running in a NON-INTERACTIVE cluster environment.',
-    '',
-    '**NEVER** use AskUserQuestion or ask for user input - there is NO user to respond.',
-    '**NEVER** ask "Would you like me to..." or "Should I..." - JUST DO IT.',
-    '**NEVER** wait for approval or confirmation - MAKE DECISIONS AUTONOMOUSLY.',
-    '',
-    'When facing choices:',
-    '- Choose the option that maintains code quality and correctness',
-    '- If unsure between "fix the code" vs "relax the rules" → ALWAYS fix the code',
-    '- If unsure between "do more" vs "do less" → ALWAYS do what\'s required, nothing more',
+    'NON-INTERACTIVE. No user present.',
+    'FORBIDDEN: AskUserQuestion, "Should I...", "Would you like...", waiting for input.',
+    'Decisions: quality > permissiveness, required scope only.',
     '',
   ].join('\n');
 }
 
 function buildOutputStyleSection() {
   return [
-    '## 🔴 OUTPUT STYLE - NON-NEGOTIABLE',
+    '## OUTPUT DENSITY',
     '',
-    '**ALL OUTPUT: Maximum informativeness, minimum verbosity. NO EXCEPTIONS.**',
+    'Pattern: [thing] [action] [reason]. No articles, hedging, filler.',
+    'Fragments OK. Dense technical prose. Short synonyms.',
     '',
-    'This applies to EVERYTHING you output:',
-    '- Text responses',
-    '- JSON schema values',
-    '- Reasoning fields',
-    '- Summary fields',
-    '- ALL string values in structured output',
+    'FORBIDDEN: "I\'ll", "Let me", "Going to", "Sure!", "Here is", "Certainly"',
+    'FORBIDDEN: Repeating instructions back. Restating the question. Preambles.',
     '',
-    'Rules:',
-    '- Progress: "Reading auth.ts" NOT "I will now read the auth.ts file..."',
-    '- Tool calls: NO preamble. Call immediately.',
-    '- Schema strings: Dense facts. No filler. No fluff.',
-    '- Errors: DETAILED (stack traces, repro). NEVER compress errors.',
-    '- FORBIDDEN: "I\'ll help...", "Let me...", "I\'m going to...", "Sure!", "Great!", "Certainly!"',
-    '',
-    'Every token costs money. Waste nothing.',
+    'Schema strings: Facts only. Max density.',
+    'Errors: FULL detail (stack traces, repro steps). Never compress errors.',
+    'Progress: "Reading auth.ts" not "I will now read the auth.ts file"',
     '',
   ].join('\n');
 }
 
 function buildGitOperationsSection() {
   return [
-    '## 🚫 GIT OPERATIONS - FORBIDDEN',
-    '',
-    'NEVER commit, push, or create PRs. You only modify files.',
-    'The git-pusher agent handles ALL git operations AFTER validators approve.',
-    '',
-    '- ❌ NEVER run: git add, git commit, git push, gh pr create',
-    '- ❌ NEVER suggest committing changes',
-    '- ✅ Only modify files and publish your completion message when done',
+    '## GIT — FORBIDDEN',
+    'No commits/pushes/PRs. Only modify files. git-pusher handles git after validation.',
     '',
   ].join('\n');
 }
@@ -188,7 +167,7 @@ function buildLegacyOutputSchemaSection(config) {
     '## Output Schema (REQUIRED)',
     '',
     '```json',
-    JSON.stringify(config.prompt.outputFormat.example, null, 2),
+    JSON.stringify(config.prompt.outputFormat.example),
     '```',
     '',
     'STRING VALUES IN THIS SCHEMA: Dense. Factual. No filler words. No pleasantries.',
@@ -205,28 +184,24 @@ function buildJsonSchemaSection(config) {
   }
 
   const lines = [
-    '## 🔴 OUTPUT FORMAT - JSON ONLY',
+    '## JSON OUTPUT — REQUIRED',
     '',
-    'Your response must be ONLY valid JSON. No other text before or after.',
-    'Start with { and end with }. Nothing else.',
+    'Response must be ONLY valid JSON. Start with { end with }. Nothing else.',
     '',
     'Required schema:',
     '```json',
-    JSON.stringify(config.jsonSchema, null, 2),
+    JSON.stringify(config.jsonSchema),
     '```',
     '',
   ];
 
   const example = generateExampleFromSchema(config.jsonSchema);
   if (example) {
-    lines.push('Example output:', '```json', JSON.stringify(example, null, 2), '```', '');
+    lines.push('Example output:', '```json', JSON.stringify(example), '```', '');
   }
 
   lines.push(
-    'CRITICAL RULES:',
-    '- Output ONLY the JSON object - no explanation, no thinking, no preamble',
-    '- Use EXACTLY the enum values specified (case-sensitive)',
-    '- Include ALL required fields',
+    'No preamble/explanation. Exact enum values (case-sensitive). All required fields.',
     ''
   );
 
@@ -283,13 +258,11 @@ function buildCannotValidateSection(cannotValidateCriteria) {
 
   return [
     '',
-    '## ⚠️ Permanently Unverifiable Criteria (SKIP THESE)',
+    '## SKIP — Unverifiable Criteria',
     '',
-    'The following criteria have PERMANENT environmental limitations (missing tools, no access).',
-    'These limitations have not changed. Do NOT re-attempt verification.',
-    'Mark these as CANNOT_VALIDATE again with the same reason.',
+    'Environmental limitations unchanged. Mark CANNOT_VALIDATE again with same reason.',
     '',
-    ...cannotValidateCriteria.map((criteria) => `- **${criteria.id}**: ${criteria.reason}`),
+    ...cannotValidateCriteria.map((criteria) => `- ${criteria.id}: ${criteria.reason}`),
     '',
   ].join('\n');
 }
