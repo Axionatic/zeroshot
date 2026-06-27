@@ -295,11 +295,9 @@ function buildTransformSandbox({ resultData, context, agent }) {
 
 function runTransformScript(script, sandbox) {
   const vmContext = vm.createContext(sandbox);
-  // codeql[js/bad-code-sanitization] Transform scripts are repo-authored config code executed only inside Zeroshot's restricted VM sandbox.
-  const wrappedScript = `(function() { ${script} })()`;
-
   try {
-    return vm.runInContext(wrappedScript, vmContext, { timeout: 5000 });
+    vmContext.__fn = vm.compileFunction(script, [], { parsingContext: vmContext });
+    return vm.runInContext('__fn()', vmContext, { timeout: 5000 });
   } catch (err) {
     throw new Error(`Transform script error: ${err.message}`);
   }
@@ -688,12 +686,11 @@ function evaluateHookLogic(params) {
 
   // Execute in VM sandbox with timeout
   const vmContext = vm.createContext(sandbox);
-  // codeql[js/bad-code-sanitization] Hook logic scripts are repo-authored config code executed only inside Zeroshot's restricted VM sandbox.
-  const wrappedScript = `(function() { 'use strict'; ${logic.script} })()`;
 
   let result;
   try {
-    result = vm.runInContext(wrappedScript, vmContext, { timeout: 1000 });
+    vmContext.__fn = vm.compileFunction(logic.script, [], { parsingContext: vmContext });
+    result = vm.runInContext('__fn()', vmContext, { timeout: 1000 });
   } catch (err) {
     throw new Error(`Hook logic script error: ${err.message}`);
   }

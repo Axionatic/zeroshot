@@ -240,5 +240,24 @@ function registerEvaluateHookLogicErrorTests() {
         });
       }, /timed out|Script execution/i);
     });
+
+    it('compiles hook logic as a function body so wrapper-breakout payloads cannot inject statements', function () {
+      // Tries to close the wrapper IIFE and smuggle a second IIFE whose return value
+      // would replace the result. SyntaxError under compileFunction; executes under
+      // string-interpolated `(function(){ ... })()` wrapping.
+      const breakout =
+        'return { topic: "SAFE" }; })(); (function() { return { topic: "INJECTED" };';
+      assert.throws(
+        () =>
+          evaluateHookLogic({
+            logic: { engine: 'javascript', script: breakout },
+            resultData: {},
+            agent: mockAgent,
+            context: mockContext,
+          }),
+        /script error/i,
+        'breakout payload must be rejected as a syntax error, not executed'
+      );
+    });
   });
 }
