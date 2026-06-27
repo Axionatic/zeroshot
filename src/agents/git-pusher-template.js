@@ -436,17 +436,17 @@ function generatePrompt(config) {
 
   // Azure-specific instructions for PR ID extraction
   const azurePrIdNote = requiresPrIdExtraction
-    ? `\n\n💡 IMPORTANT: The output will contain the PR ID. You MUST extract it for the next step.
+    ? `\n\nThe output will contain the PR ID. Extract it for the next step.
 Look for output like: "Created PR 123" or parse the URL for the PR number.
 Save the PR ID to a variable for step 6.`
     : '';
 
   // Azure uses different merge terminology
   const mergeDescription = requiresPrIdExtraction
-    ? 'SET AUTO-COMPLETE (MANDATORY - THIS IS NOT OPTIONAL)'
+    ? 'Set auto-complete'
     : usesMergeQueue
-      ? `ENQUEUE INTO MERGE QUEUE AND WAIT UNTIL THE ${prName} IS MERGED (MANDATORY - THIS IS NOT OPTIONAL)`
-      : `MERGE THE ${prName} (MANDATORY - THIS IS NOT OPTIONAL)`;
+      ? `Enqueue into merge queue and wait until the ${prName} is merged`
+      : `Merge the ${prName}`;
 
   const mergeExplanation = requiresPrIdExtraction
     ? `Replace <PR_ID> with the actual PR number from step 5.
@@ -479,14 +479,14 @@ If truly no changes exist, output:
 {"${outputFields.urlField}": null, "${outputFields.numberField}": null, "merged": false}
 \`\`\``;
 
-  return `CRITICAL: ALL VALIDATORS APPROVED. YOU ARE A TRANSPORT-ONLY GIT PUSHER.
+  return `All validators approved. You are a transport-only git pusher.
 
 Your job is to preserve validator ownership: stage, commit, push, create the ${prName}, then merge or enable auto-merge when possible.
 
-Do NOT edit source files, tests, configs, generated artifacts, or lockfiles.
-Do NOT inspect CI logs to debug product code.
-Do NOT resolve merge conflicts or rebase conflicts.
-Do NOT run implementation/debugging workflows after validators hand off.
+Do not edit source files, tests, configs, generated artifacts, or lockfiles.
+Do not inspect CI logs to debug product code.
+Do not resolve merge conflicts or rebase conflicts.
+Do not run implementation/debugging workflows after validators hand off.
 
 Allowed after validation:
 - git add/status/commit/push
@@ -496,45 +496,45 @@ Allowed after validation:
 
 If commit hooks, push, ${prName} creation, merge, CI, or conflict handling requires code changes, STOP and report the blocked state in JSON. The implementation and validator agents must fix code and rerun quality gates.
 
-## MANDATORY STEPS - EXECUTE EACH ONE IN ORDER - DO NOT SKIP ANY STEP
+## Steps — execute each one in order
 
-### STEP 1: Stage ALL changes (MANDATORY)
+### Step 1: Stage all changes
 \`\`\`bash
 git add -A
 \`\`\`
 Run this command. Do not skip it. If commit fails because hooks/checks fail, do not edit files. Output blocked JSON with the failure summary.
 
-### STEP 2: Check what's staged
+### Step 2: Check what's staged
 \`\`\`bash
 git status
 \`\`\`
 Run this. If nothing to commit, output JSON with ${outputFields.urlField}: null and stop.
 
-### STEP 3: Commit the changes (MANDATORY if there are changes)
+### Step 3: Commit the changes (if there are changes)
 \`\`\`bash
 git commit -m "feat: implement #{{issue_number}} - {{issue_title}}"
 \`\`\`
 Run this command. Do not skip it.
 
-### STEP 4: Push to origin (MANDATORY)
+### Step 4: Push to origin
 \`\`\`bash
 git push -u origin HEAD
 \`\`\`
 Run this. If it fails, do not edit files, rebase, or resolve conflicts. Output blocked JSON with the failure summary.
 
-⚠️ AFTER PUSH YOU ARE NOT DONE! CONTINUE TO STEP 5! ⚠️
+Continue to step 5.
 
-### STEP 5: CREATE THE ${prName.toUpperCase()} (MANDATORY - YOU MUST RUN THIS COMMAND)
+### Step 5: Create the ${prName}
 \`\`\`bash
 ${createCmd}
 \`\`\`
-🚨 YOU MUST RUN \`${createCmd.split(' ').slice(0, 3).join(' ')}\`! Outputting a link is NOT creating a ${prName}! 🚨
-The push output shows a "Create a ${prNameLower}" link - IGNORE IT.
-You MUST run the \`${createCmd.split(' ').slice(0, 3).join(' ')}\` command above.${requiresPrIdExtraction ? '' : ` Save the actual ${prName} URL from the output.`}${azurePrIdNote}
+Run \`${createCmd.split(' ').slice(0, 3).join(' ')}\`. Outputting a link does not create a ${prName}.
+The push output shows a "Create a ${prNameLower}" link — ignore it.
+Run the \`${createCmd.split(' ').slice(0, 3).join(' ')}\` command above.${requiresPrIdExtraction ? '' : ` Save the actual ${prName} URL from the output.`}${azurePrIdNote}
 
-⚠️ AFTER ${prName} CREATION YOU ARE NOT DONE! CONTINUE TO STEP 6! ⚠️
+Continue to step 6.
 
-### STEP 6: ${mergeDescription}
+### Step 6: ${mergeDescription}
 \`\`\`bash
 ${mergeCmd}
 \`\`\`
@@ -579,17 +579,17 @@ Only do this AFTER the ${prName} is merged.`
     : ''
 }
 
-## CRITICAL RULES
-- Execute EVERY step in order (1, 2, 3, 4, 5, 6)
-- Do NOT skip git add -A
-- Do NOT skip git commit
-- Do NOT skip ${createCmd.split(' ').slice(0, 3).join(' ')} - THE TASK IS NOT DONE UNTIL ${prName} EXISTS
-- Do NOT skip ${mergeCmd.split(' ').slice(0, 4).join(' ')} - attempt merge or auto-merge before reporting blocked${requiresPrIdExtraction ? '\n- MUST extract PR ID from step 5 output to use in step 6' : ''}
-- Do NOT edit files after validator handoff
-- Do NOT debug product failures after validator handoff
+## Rules
+- Execute every step in order (1, 2, 3, 4, 5, 6)
+- Do not skip git add -A
+- Do not skip git commit
+- Do not skip ${createCmd.split(' ').slice(0, 3).join(' ')} — the task is not done until ${prName} exists
+- Do not skip ${mergeCmd.split(' ').slice(0, 4).join(' ')} — attempt merge or auto-merge before reporting blocked${requiresPrIdExtraction ? '\n- Extract PR ID from step 5 output to use in step 6' : ''}
+- Do not edit files after validator handoff
+- Do not debug product failures after validator handoff
 - If push, ${prName} creation, CI, or ${requiresPrIdExtraction ? 'auto-complete' : 'merge'} fails, report it instead of fixing code
 - Output JSON only after the ${prName} is merged, auto-merge is enabled/pending, or a non-code transport failure blocks progress
-- A link from git push is NOT a ${prName} - you must run ${createCmd.split(' ').slice(0, 3).join(' ')}
+- A link from git push is not a ${prName} — run ${createCmd.split(' ').slice(0, 3).join(' ')} to create one
 
 ## Final Output
 ${finalOutputNote}

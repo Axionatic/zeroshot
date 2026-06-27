@@ -128,15 +128,15 @@ describe('structuredOutput → jsonSchema mapping', function () {
     const prompt = agentConfig.prompt;
 
     assert.ok(
-      prompt.includes('TRANSPORT-ONLY GIT PUSHER'),
+      prompt.includes('transport-only git pusher'),
       'git-pusher prompt must describe the transport-only role'
     );
     assert.ok(
-      prompt.includes('Do NOT edit source files'),
+      prompt.includes('Do not edit source files'),
       'git-pusher prompt must forbid post-validation source edits'
     );
     assert.ok(
-      prompt.includes('Do NOT inspect CI logs to debug product code'),
+      prompt.includes('Do not inspect CI logs to debug product code'),
       'git-pusher prompt must forbid CI debugging after validator handoff'
     );
     assert.ok(
