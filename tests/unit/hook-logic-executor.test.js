@@ -259,5 +259,25 @@ function registerEvaluateHookLogicErrorTests() {
         'breakout payload must be rejected as a syntax error, not executed'
       );
     });
+
+    it('runs hook logic in strict mode so `this` cannot reach the host realm', function () {
+      // Under strict mode the bare `__fn()` call binds `this` to undefined, so the
+      // classic `this.constructor.constructor("return process")()` vm-escape chain
+      // dead-ends at `this`. Without strict, `this` is the contextified global whose
+      // prototype chain leads to the host Function, reaching host `process`.
+      const probe =
+        'return { reachedFn: typeof (this && this.constructor && this.constructor.constructor) };';
+      const result = evaluateHookLogic({
+        logic: { engine: 'javascript', script: probe },
+        resultData: {},
+        agent: mockAgent,
+        context: mockContext,
+      });
+      assert.strictEqual(
+        result.reachedFn,
+        'undefined',
+        'strict-mode `this` must be undefined, severing the constructor.constructor host-reach'
+      );
+    });
   });
 }

@@ -296,7 +296,11 @@ function buildTransformSandbox({ resultData, context, agent }) {
 function runTransformScript(script, sandbox) {
   const vmContext = vm.createContext(sandbox);
   try {
-    vmContext.__fn = vm.compileFunction(script, [], { parsingContext: vmContext });
+    // Strict mode: bare `__fn()` binds `this` to undefined (not the contextified
+    // global), severing the `this.constructor.constructor(...)` reach-into-host vector.
+    vmContext.__fn = vm.compileFunction(`'use strict';\n${script}`, [], {
+      parsingContext: vmContext,
+    });
     return vm.runInContext('__fn()', vmContext, { timeout: 5000 });
   } catch (err) {
     throw new Error(`Transform script error: ${err.message}`);
@@ -689,7 +693,11 @@ function evaluateHookLogic(params) {
 
   let result;
   try {
-    vmContext.__fn = vm.compileFunction(logic.script, [], { parsingContext: vmContext });
+    // Strict mode: bare `__fn()` binds `this` to undefined (not the contextified
+    // global), severing the `this.constructor.constructor(...)` reach-into-host vector.
+    vmContext.__fn = vm.compileFunction(`'use strict';\n${logic.script}`, [], {
+      parsingContext: vmContext,
+    });
     result = vm.runInContext('__fn()', vmContext, { timeout: 1000 });
   } catch (err) {
     throw new Error(`Hook logic script error: ${err.message}`);
