@@ -290,6 +290,42 @@ describe('analyzeMessageFlow - topic coverage', function () {
     });
     assert.ok(result.errors.some((e) => e.includes('echo') && e.includes('infinite loop')));
   });
+
+  it('should not let an execute_system_command onComplete topic mask a missing producer', function () {
+    // onComplete never fires for execute_system_command, so its config.topic must NOT
+    // register as a producer. Otherwise a consumer of that topic passes validation and
+    // the cluster stalls at runtime waiting on a topic that is never published.
+    const result = analyzeMessageFlow({
+      agents: [
+        {
+          id: 'sys',
+          role: 'impl',
+          triggers: [
+            {
+              topic: 'ISSUE_OPENED',
+              action: 'execute_system_command',
+              config: { command: 'echo hi' },
+            },
+          ],
+          hooks: { onComplete: { action: 'publish_message', config: { topic: 'DEAD_TOPIC' } } },
+        },
+        {
+          id: 'waiter',
+          role: 'impl',
+          triggers: [{ topic: 'DEAD_TOPIC' }],
+        },
+        {
+          id: 'completion',
+          role: 'orchestrator',
+          triggers: [{ topic: 'X', action: 'stop_cluster' }],
+        },
+      ],
+    });
+    assert.ok(
+      result.errors.some((e) => e.includes('DEAD_TOPIC') && e.includes('never produced')),
+      'dead execute_system_command onComplete topic must not satisfy a consumer'
+    );
+  });
 });
 
 describe('analyzeMessageFlow - cycle handling', function () {

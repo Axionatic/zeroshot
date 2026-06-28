@@ -385,17 +385,24 @@ function extractDynamicTopicsFromScript(script, ctx) {
 
 function recordAgentOutputs(agent, topicProducers, agentOutputTopics) {
   const hook = agent.hooks?.onComplete;
-  const outputTopic = agent.hooks?.onComplete?.config?.topic;
-  if (outputTopic) {
-    recordOutputTopic(agent, outputTopic, topicProducers, agentOutputTopics);
-  }
 
-  const ctx = { outputTopic, agentId: agent.id, topicProducers, agentOutputTopics };
-  extractDynamicTopicsFromScript(hook?.logic?.script, ctx);
-  extractDynamicTopicsFromScript(hook?.transform?.script, ctx);
+  // hooks.onComplete only fires for execute_task actions, not execute_system_command.
+  // Recording onComplete-derived producers for a system-command agent would register a
+  // topic that is never actually published, masking the "consumed but never produced"
+  // error and letting the cluster stall waiting on a dead producer.
+  if (agentExecutesTask(agent)) {
+    const outputTopic = hook?.config?.topic;
+    if (outputTopic) {
+      recordOutputTopic(agent, outputTopic, topicProducers, agentOutputTopics);
+    }
 
-  for (const contract of getHookActionTopicContracts(hook)) {
-    recordOutputTopic(agent, contract.topic, topicProducers, agentOutputTopics);
+    const ctx = { outputTopic, agentId: agent.id, topicProducers, agentOutputTopics };
+    extractDynamicTopicsFromScript(hook?.logic?.script, ctx);
+    extractDynamicTopicsFromScript(hook?.transform?.script, ctx);
+
+    for (const contract of getHookActionTopicContracts(hook)) {
+      recordOutputTopic(agent, contract.topic, topicProducers, agentOutputTopics);
+    }
   }
 
   // Register topics from trigger.config.onSuccess (for execute_system_command agents)
