@@ -777,6 +777,9 @@ function collectTopicContracts(config) {
   for (const agent of config.agents || []) {
     const hook = agent?.hooks?.onComplete;
     if (!hook) continue;
+    // onComplete only fires for execute_task; a system-command agent's onComplete
+    // contract is never published, so it must not register a schema contract.
+    if (!agentExecutesTask(agent)) continue;
 
     const topics = extractHookTopics(hook);
     const staticKeys = extractPublishedDataKeys(hook);
