@@ -55,7 +55,9 @@ function registerForbiddenApproachesTests() {
     it('must exist in fixer prompt', () => {
       const prompt = loadFixerPrompt();
 
-      assert(prompt.includes('FORBIDDEN'), 'Prompt must have FORBIDDEN section');
+      // Case-insensitive: the guardrail is the content, not its casing. The fixer
+      // prompt was de-escalated (## Forbidden patterns) without removing the section.
+      assert(/forbidden/i.test(prompt), 'Prompt must have a forbidden-approaches section');
       assert(
         prompt.includes('SHORTCUTS') || prompt.includes('HIDE'),
         'Must explain WHY these are forbidden'
@@ -120,9 +122,11 @@ function registerAggressiveRejectionHandlingTests() {
     it('must instruct fixer to READ feedback', () => {
       const prompt = loadFixerPrompt();
 
+      // Case-insensitive: enforce that the prompt instructs reading the feedback,
+      // regardless of de-escalated casing ("read the feedback").
       assert(
-        prompt.includes('READ') && prompt.includes('FEEDBACK'),
-        'Must instruct fixer to READ FEEDBACK'
+        /read/i.test(prompt) && /feedback/i.test(prompt),
+        'Must instruct fixer to read the feedback'
       );
     });
 
