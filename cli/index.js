@@ -52,7 +52,7 @@ const { MOUNT_PRESETS, resolveEnvs } = require('../lib/docker-config');
 const {
   detectGitRepoRoot,
   detectRunInput,
-  loadClusterConfig,
+  loadForegroundConfig,
   resolveConfigPath,
   resolveProviderOverride,
   startClusterFromFile,
@@ -2504,7 +2504,13 @@ Force provider flags: -G (GitHub), -L (GitLab), -J (Jira), -D (DevOps)
       const configName = resolveConfigName(options, settings);
       const configPath = resolveConfigPath(configName);
       const orchestrator = await getOrchestrator();
-      const config = loadClusterConfig(orchestrator, configPath, settings, providerOverride);
+      const config = loadForegroundConfig({
+        orchestrator,
+        configPath,
+        settings,
+        providerOverride,
+        options,
+      });
       trackActiveCluster(clusterId, orchestrator);
       printForegroundStartInfo(options, clusterId, configName);
 
