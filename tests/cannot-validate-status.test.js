@@ -292,7 +292,7 @@ describe('CANNOT_VALIDATE Context Builder - Core Behavior', function () {
         })
       );
       assert.ok(
-        !context.includes('Permanently Unverifiable Criteria'),
+        !context.includes('SKIP — Unverifiable Criteria'),
         `Should NOT inject for role="${role}"`
       );
     }

@@ -224,6 +224,39 @@ describe('analyzeMessageFlow - kickoff requirements', function () {
     });
     assert.ok(result.errors.some((e) => e.includes('Multiple completion handlers')));
   });
+
+  it('should not count a system-command-only onComplete CLUSTER_COMPLETE as a completion handler', function () {
+    // onComplete never fires for execute_system_command, so a dead
+    // onComplete->CLUSTER_COMPLETE must not inflate the handler count and
+    // falsely collide with the real stop_cluster agent.
+    const result = analyzeMessageFlow({
+      agents: [
+        {
+          id: 'sys',
+          role: 'impl',
+          triggers: [
+            {
+              topic: 'ISSUE_OPENED',
+              action: 'execute_system_command',
+              config: { command: 'echo hi' },
+            },
+          ],
+          hooks: {
+            onComplete: { action: 'publish_message', config: { topic: 'CLUSTER_COMPLETE' } },
+          },
+        },
+        {
+          id: 'completion',
+          role: 'orchestrator',
+          triggers: [{ topic: 'ISSUE_OPENED', action: 'stop_cluster' }],
+        },
+      ],
+    });
+    assert.ok(
+      !result.errors.some((e) => e.includes('Multiple completion handlers')),
+      'dead system-command onComplete->CLUSTER_COMPLETE must not count as a handler'
+    );
+  });
 });
 
 describe('analyzeMessageFlow - topic coverage', function () {
@@ -289,6 +322,42 @@ describe('analyzeMessageFlow - topic coverage', function () {
       ],
     });
     assert.ok(result.errors.some((e) => e.includes('echo') && e.includes('infinite loop')));
+  });
+
+  it('should not let an execute_system_command onComplete topic mask a missing producer', function () {
+    // onComplete never fires for execute_system_command, so its config.topic must NOT
+    // register as a producer. Otherwise a consumer of that topic passes validation and
+    // the cluster stalls at runtime waiting on a topic that is never published.
+    const result = analyzeMessageFlow({
+      agents: [
+        {
+          id: 'sys',
+          role: 'impl',
+          triggers: [
+            {
+              topic: 'ISSUE_OPENED',
+              action: 'execute_system_command',
+              config: { command: 'echo hi' },
+            },
+          ],
+          hooks: { onComplete: { action: 'publish_message', config: { topic: 'DEAD_TOPIC' } } },
+        },
+        {
+          id: 'waiter',
+          role: 'impl',
+          triggers: [{ topic: 'DEAD_TOPIC' }],
+        },
+        {
+          id: 'completion',
+          role: 'orchestrator',
+          triggers: [{ topic: 'X', action: 'stop_cluster' }],
+        },
+      ],
+    });
+    assert.ok(
+      result.errors.some((e) => e.includes('DEAD_TOPIC') && e.includes('never produced')),
+      'dead execute_system_command onComplete topic must not satisfy a consumer'
+    );
   });
 });
 
@@ -426,6 +495,180 @@ describe('analyzeMessageFlow - validator flows', function () {
       ],
     });
     assert.strictEqual(result.errors.length, 0);
+  });
+});
+
+describe('analyzeMessageFlow - resolved topology regression checks', function () {
+  it('should not skip flow validation when conductor config already has runtime agents', function () {
+    const result = validateConfig({
+      agents: [
+        {
+          id: 'junior-conductor',
+          role: 'conductor',
+          triggers: [{ topic: 'ISSUE_OPENED', action: 'execute_task' }],
+          hooks: {
+            onComplete: {
+              action: 'publish_message',
+              config: {
+                topic: 'CLUSTER_OPERATIONS',
+                content: {
+                  data: {
+                    operations: [{ action: 'load_config', config: 'worker-validator' }],
+                  },
+                },
+              },
+            },
+          },
+        },
+        {
+          id: 'worker',
+          role: 'implementation',
+          triggers: [{ topic: 'PLAN_READY', action: 'execute_task' }],
+          hooks: {
+            onComplete: {
+              action: 'publish_message',
+              config: { topic: 'IMPLEMENTATION_READY' },
+            },
+          },
+        },
+        {
+          id: 'completion-detector',
+          role: 'orchestrator',
+          triggers: [{ topic: 'IMPLEMENTATION_READY', action: 'stop_cluster' }],
+        },
+      ],
+    });
+
+    assert.ok(
+      result.errors.some((e) => e.includes('PLAN_READY') && e.includes('never produced')),
+      `Expected unproduced PLAN_READY error, got: ${result.errors.join(' | ')}`
+    );
+  });
+
+  it('should flag dead-end flows that cannot reach completion', function () {
+    const result = analyzeMessageFlow({
+      agents: [
+        {
+          id: 'worker',
+          role: 'implementation',
+          triggers: [{ topic: 'ISSUE_OPENED', action: 'execute_task' }],
+          hooks: {
+            onComplete: {
+              action: 'publish_message',
+              config: { topic: 'WORKER_PROGRESS' },
+            },
+          },
+        },
+        {
+          id: 'completion',
+          role: 'orchestrator',
+          triggers: [{ topic: 'DONE', action: 'stop_cluster' }],
+        },
+      ],
+    });
+
+    assert.ok(
+      result.errors.some((e) =>
+        e.includes('No reachable path from ISSUE_OPENED to terminal signal')
+      ),
+      `Expected missing completion path error, got: ${result.errors.join(' | ')}`
+    );
+  });
+});
+
+describe('analyzeMessageFlow - schema contract regression checks', function () {
+  it('should flag trigger scripts that require missing content.data keys', function () {
+    const result = analyzeMessageFlow({
+      agents: [
+        {
+          id: 'worker',
+          role: 'implementation',
+          triggers: [{ topic: 'ISSUE_OPENED', action: 'execute_task' }],
+          hooks: {
+            onComplete: {
+              action: 'publish_message',
+              config: {
+                topic: 'VALIDATION_RESULT',
+                content: {
+                  data: {
+                    approved: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+        {
+          id: 'downstream-consumer',
+          role: 'implementation',
+          triggers: [
+            {
+              topic: 'VALIDATION_RESULT',
+              logic: {
+                script: 'return message.content.data.errors.length === 0;',
+              },
+              action: 'execute_task',
+            },
+          ],
+        },
+        {
+          id: 'completion',
+          role: 'orchestrator',
+          triggers: [{ topic: 'VALIDATION_RESULT', action: 'stop_cluster' }],
+        },
+      ],
+    });
+
+    assert.ok(
+      result.errors.some(
+        (e) => e.includes('expects content.data.errors') && e.includes('VALIDATION_RESULT')
+      ),
+      `Expected schema contract error, got: ${result.errors.join(' | ')}`
+    );
+  });
+
+  it('should not treat optional chained content.data access as required', function () {
+    const result = analyzeMessageFlow({
+      agents: [
+        {
+          id: 'worker',
+          role: 'implementation',
+          triggers: [{ topic: 'ISSUE_OPENED', action: 'execute_task' }],
+          hooks: {
+            onComplete: {
+              action: 'publish_message',
+              config: {
+                topic: 'VALIDATION_RESULT',
+                content: {
+                  data: {
+                    approved: true,
+                    errors: [],
+                  },
+                },
+              },
+            },
+          },
+        },
+        {
+          id: 'completion',
+          role: 'orchestrator',
+          triggers: [
+            {
+              topic: 'VALIDATION_RESULT',
+              action: 'stop_cluster',
+              logic: {
+                script: 'return message?.content?.data?.criteriaResults?.length > 0;',
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.ok(
+      !result.errors.some((e) => e.includes('criteriaResults') && e.includes('no producer for')),
+      `Expected no criteriaResults schema error, got: ${result.errors.join(' | ')}`
+    );
   });
 });
 
@@ -684,6 +927,45 @@ describe('validateConfig (full)', function () {
       nonCompletionErrors.length,
       0,
       `Unexpected errors: ${nonCompletionErrors.join(', ')}`
+    );
+  });
+
+  it('should not skip message-flow validation for a system-command-only conductor', function () {
+    // A conductor whose only trigger is execute_system_command never fires its
+    // onComplete, so it never publishes CLUSTER_OPERATIONS. It must NOT be
+    // treated as a conductor config (which skips message-flow analysis) — the
+    // dead topology has to be caught rather than validating clean.
+    const config = {
+      name: 'sys-conductor',
+      agents: [
+        {
+          id: 'conductor',
+          role: 'conductor',
+          modelLevel: 'level2',
+          triggers: [
+            {
+              topic: 'ISSUE_OPENED',
+              action: 'execute_system_command',
+              config: { command: 'echo hi' },
+            },
+          ],
+          hooks: {
+            onComplete: {
+              action: 'execute_command',
+              transform: {
+                script:
+                  'return { topic: "CLUSTER_OPERATIONS", content: { data: { operations: JSON.stringify([]) } } };',
+              },
+            },
+          },
+        },
+      ],
+    };
+    const result = validateConfig(config);
+    assert.strictEqual(result.valid, false);
+    assert.ok(
+      result.errors.some((e) => e.includes('terminal signal')),
+      `message-flow analysis must run; got: ${result.errors.join(' | ')}`
     );
   });
 

@@ -240,5 +240,44 @@ function registerEvaluateHookLogicErrorTests() {
         });
       }, /timed out|Script execution/i);
     });
+
+    it('compiles hook logic as a function body so wrapper-breakout payloads cannot inject statements', function () {
+      // Tries to close the wrapper IIFE and smuggle a second IIFE whose return value
+      // would replace the result. SyntaxError under compileFunction; executes under
+      // string-interpolated `(function(){ ... })()` wrapping.
+      const breakout =
+        'return { topic: "SAFE" }; })(); (function() { return { topic: "INJECTED" };';
+      assert.throws(
+        () =>
+          evaluateHookLogic({
+            logic: { engine: 'javascript', script: breakout },
+            resultData: {},
+            agent: mockAgent,
+            context: mockContext,
+          }),
+        /script error/i,
+        'breakout payload must be rejected as a syntax error, not executed'
+      );
+    });
+
+    it('runs hook logic in strict mode so `this` cannot reach the host realm', function () {
+      // Under strict mode the bare `__fn()` call binds `this` to undefined, so the
+      // classic `this.constructor.constructor("return process")()` vm-escape chain
+      // dead-ends at `this`. Without strict, `this` is the contextified global whose
+      // prototype chain leads to the host Function, reaching host `process`.
+      const probe =
+        'return { reachedFn: typeof (this && this.constructor && this.constructor.constructor) };';
+      const result = evaluateHookLogic({
+        logic: { engine: 'javascript', script: probe },
+        resultData: {},
+        agent: mockAgent,
+        context: mockContext,
+      });
+      assert.strictEqual(
+        result.reachedFn,
+        'undefined',
+        'strict-mode `this` must be undefined, severing the constructor.constructor host-reach'
+      );
+    });
   });
 }

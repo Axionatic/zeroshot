@@ -55,7 +55,7 @@
     "quality_gate": {
       "type": "boolean",
       "default": true,
-      "description": "Run automated quality checks (tests/lint) before analysis"
+      "description": "Run the pre-validation gate (automated quality checks, tests/lint) before analysis"
     }
   },
   "agents": [
