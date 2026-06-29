@@ -35,6 +35,10 @@ function isConductorConfig(config) {
   const hasConductorOps = agents.some(
     (a) =>
       a.role === 'conductor' &&
+      // onComplete only fires for execute_task agents; a system-command-only
+      // conductor never publishes CLUSTER_OPERATIONS, so it must not skip
+      // message-flow validation (which assumes runtime agents arrive later).
+      agentExecutesTask(a) &&
       // Old style: static topic in config
       (a.hooks?.onComplete?.config?.topic === 'CLUSTER_OPERATIONS' ||
         // New style: topic set in transform script (check for CLUSTER_OPERATIONS in script)
@@ -457,7 +461,9 @@ function reportCompletionHandlers(config, errors, warnings) {
       a.triggers?.some((t) => t.action === 'stop_cluster') ||
       a.id === 'completion-detector' ||
       a.id === 'git-pusher' ||
-      a.hooks?.onComplete?.config?.topic === 'CLUSTER_COMPLETE'
+      // onComplete only fires for execute_task agents; a system-command-only
+      // agent's onComplete->CLUSTER_COMPLETE never runs, so it is not a handler.
+      (agentExecutesTask(a) && a.hooks?.onComplete?.config?.topic === 'CLUSTER_COMPLETE')
   );
   const isTemplateConfig = config.params && Object.keys(config.params).length > 0;
   // Conductor-driven configs (merged conductor + template agents) rely on idle timeout

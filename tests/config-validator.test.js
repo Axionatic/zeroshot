@@ -224,6 +224,39 @@ describe('analyzeMessageFlow - kickoff requirements', function () {
     });
     assert.ok(result.errors.some((e) => e.includes('Multiple completion handlers')));
   });
+
+  it('should not count a system-command-only onComplete CLUSTER_COMPLETE as a completion handler', function () {
+    // onComplete never fires for execute_system_command, so a dead
+    // onComplete->CLUSTER_COMPLETE must not inflate the handler count and
+    // falsely collide with the real stop_cluster agent.
+    const result = analyzeMessageFlow({
+      agents: [
+        {
+          id: 'sys',
+          role: 'impl',
+          triggers: [
+            {
+              topic: 'ISSUE_OPENED',
+              action: 'execute_system_command',
+              config: { command: 'echo hi' },
+            },
+          ],
+          hooks: {
+            onComplete: { action: 'publish_message', config: { topic: 'CLUSTER_COMPLETE' } },
+          },
+        },
+        {
+          id: 'completion',
+          role: 'orchestrator',
+          triggers: [{ topic: 'ISSUE_OPENED', action: 'stop_cluster' }],
+        },
+      ],
+    });
+    assert.ok(
+      !result.errors.some((e) => e.includes('Multiple completion handlers')),
+      'dead system-command onComplete->CLUSTER_COMPLETE must not count as a handler'
+    );
+  });
 });
 
 describe('analyzeMessageFlow - topic coverage', function () {
@@ -894,6 +927,45 @@ describe('validateConfig (full)', function () {
       nonCompletionErrors.length,
       0,
       `Unexpected errors: ${nonCompletionErrors.join(', ')}`
+    );
+  });
+
+  it('should not skip message-flow validation for a system-command-only conductor', function () {
+    // A conductor whose only trigger is execute_system_command never fires its
+    // onComplete, so it never publishes CLUSTER_OPERATIONS. It must NOT be
+    // treated as a conductor config (which skips message-flow analysis) — the
+    // dead topology has to be caught rather than validating clean.
+    const config = {
+      name: 'sys-conductor',
+      agents: [
+        {
+          id: 'conductor',
+          role: 'conductor',
+          modelLevel: 'level2',
+          triggers: [
+            {
+              topic: 'ISSUE_OPENED',
+              action: 'execute_system_command',
+              config: { command: 'echo hi' },
+            },
+          ],
+          hooks: {
+            onComplete: {
+              action: 'execute_command',
+              transform: {
+                script:
+                  'return { topic: "CLUSTER_OPERATIONS", content: { data: { operations: JSON.stringify([]) } } };',
+              },
+            },
+          },
+        },
+      ],
+    };
+    const result = validateConfig(config);
+    assert.strictEqual(result.valid, false);
+    assert.ok(
+      result.errors.some((e) => e.includes('terminal signal')),
+      `message-flow analysis must run; got: ${result.errors.join(' | ')}`
     );
   });
 
