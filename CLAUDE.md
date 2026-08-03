@@ -299,14 +299,11 @@ Parameterize from `cluster.config.complexity`, never hardcode in templates.
 
 ## Git Workflow
 
-**Merge queue enforces CI on rebased code before merge.**
+**Nothing blocks direct pushes to `main`.** Deliberate — solo internal fork. `.husky/pre-push` PART 1 is disabled and `main` has no branch protection or rulesets. There is no merge queue.
 
-```
-feature-branch → pre-push hook (~5s) → push → gh pr create --base main
-→ CI on PR → gh pr merge --auto --squash → merge queue rebases + CI → merge
-```
+**Pre-push hook does block** (all skipped when `CI` is set): manual `v*` version tags · a failing `npm run lint && npm run typecheck && npm test` · `.audit-ignore` older than 30 days.
 
-**Pre-push hook blocks:** Direct pushes to `main`. Must use PR workflow.
+PR workflow is still preferred for anything non-trivial, since CI only runs on PRs:
 
 ```bash
 git switch -c feat/my-feature
@@ -323,7 +320,7 @@ gh pr merge --auto --squash
 - **Test-First:** Write tests WITH code. Pre-commit hook validates test file exists.
 - **Validation:** Run `npm run lint && npm run test` for >50-line changes. Trust pre-commit for trivial.
 - **CI Diagnosis:** Diagnose each failing job independently. Fix one, push, rerun, repeat. Do NOT assume single root cause.
-- **Release Pipeline:** Dev requires `check` only (merge queue). Main requires `check` + `install-matrix`. Cross-platform `install-matrix` runs in CI for main only.
+- **Release Pipeline:** CI triggers on pushes to `main` and PRs targeting `main` — this fork has no `dev` branch. `install-matrix` (cross-platform) needs `check` to pass and is gated to `main` refs, PRs based on `main`, and merge groups. Neither job is a required check, so neither can block a merge or a direct push.
 
 ## Enforcement Philosophy
 
@@ -377,7 +374,13 @@ Implementation: `src/agent/agent-lifecycle.js:316`
 
 Live StatusFooter display of Claude Code subagents (Task tool). `buildSpawnEnv()` sets `ZEROSHOT_TRACK_SUBAGENTS=1` + events file path → Claude hook writes JSONL start/stop events → `SubagentTracker` polls with offset tracking → `StatusFooter` renders tree rows.
 
-Implementation: `src/subagent-tracker.js`, `src/status-footer.js`, `src/agent/agent-task-executor.js:679`
+**Claude provider only.** Both the installer and the env wiring live inside `if (providerName === 'claude')` — codex/gemini/opencode agents emit no events.
+
+The producer hook ships in `cluster-hooks/track-subagents.py` and is installed by `ensureSubagentTrackingHook()`, alongside `ensureAskUserQuestionHook()` / `ensureDangerousGitHook()`. It differs from those in registering on two lifecycle events (`SubagentStart` + `SubagentStop`) rather than one `PreToolUse` matcher — both ends are required, since start-only leaves subagents active forever and stop-only never shows them — and in registering nothing when its script is missing, rather than pointing Claude at a file that will never exist.
+
+🔴 **Hook scripts must be resolved from `cluster-hooks/`, never the `hooks/` symlink.** `npm pack` drops symlinks, so `hooks/` does not exist in an installed package and every hook silently fails to install.
+
+Implementation: `cluster-hooks/track-subagents.py` (producer), `src/agent/agent-task-executor.js` (`ensureSubagentTrackingHook`, `buildSpawnEnv` env wiring), `src/subagent-tracker.js` (consumer), `src/status-footer.js` (render). Test: `tests/unit/subagent-tracking-hook.test.js`
 
 ### Quality Gate
 
@@ -389,7 +392,7 @@ Zero-cost checks (lint, typecheck, tests) between worker completion and validato
 
 ## CI & Branch Protection (Fork)
 
-**Ruleset: `main-protection`** — require PRs (0 approvals), require status checks (`check` + both `install-matrix` jobs), strict up-to-date policy. Auto-merge enabled.
+**No branch protection, by choice.** No rulesets, and `main` has no legacy protection — nothing server-side requires PRs, status checks, or up-to-date branches. (An empty `main-protection` ruleset was deleted on 2026-08-03; "active" with zero rules only ever implied protection that did not exist.) Auto-merge and squash-merge are enabled at the repo level. CI runs on pushes to `main` and on PRs, but is not a required check and cannot gate either.
 
 **Audit exclusion:** `.audit-ignore` (gitignored) lists known-unfixable GHSA IDs → pre-push hook syncs to `AUDIT_IGNORE` GitHub Actions secret → CI filters `npm audit --json` output, failing only on new advisories.
 

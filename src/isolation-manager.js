@@ -1043,12 +1043,17 @@ class IsolationManager {
     }
 
     // Copy hook script to block AskUserQuestion (CRITICAL for autonomous execution)
-    const hookScriptSrc = path.join(__dirname, '..', 'hooks', 'block-ask-user-question.py');
+    const hookScriptSrc = path.join(__dirname, '..', 'cluster-hooks', 'block-ask-user-question.py');
     const hookScriptDst = path.join(hooksDir, 'block-ask-user-question.py');
-    if (fs.existsSync(hookScriptSrc)) {
-      fs.copyFileSync(hookScriptSrc, hookScriptDst);
-      fs.chmodSync(hookScriptDst, 0o755);
+    if (!fs.existsSync(hookScriptSrc)) {
+      throw new Error(
+        `Cannot isolate cluster ${clusterId}: hook script missing at ${hookScriptSrc}. ` +
+          'Without it agents can block on AskUserQuestion forever. ' +
+          'Check that cluster-hooks/ is listed in package.json "files".'
+      );
     }
+    fs.copyFileSync(hookScriptSrc, hookScriptDst);
+    fs.chmodSync(hookScriptDst, 0o755);
 
     // Create settings.json with PreToolUse hook to block AskUserQuestion
     // This PREVENTS agents from asking questions in non-interactive mode

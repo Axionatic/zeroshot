@@ -368,6 +368,7 @@ function extractErrorContext({ output, statusOutput, taskId, isNotFound = false,
 // Track which config dirs already have zeroshot-installed hooks.
 const askUserQuestionHookInstalledDirs = new Set();
 const dangerousGitHookInstalledDirs = new Set();
+const subagentTrackingHookInstalledDirs = new Set();
 
 /**
  * Extract token usage from NDJSON output.
@@ -440,18 +441,23 @@ function ensureAskUserQuestionHook(targetClaudeDir = null) {
   const hookScriptName = 'block-ask-user-question.py';
   const hookScriptDst = path.join(hooksDir, hookScriptName);
 
+  const hookScriptSrc = path.join(__dirname, '..', '..', 'cluster-hooks', hookScriptName);
+  if (!fs.existsSync(hookScriptSrc)) {
+    // Registering a command that will never exist is worse than failing here:
+    // agents would block on AskUserQuestion with no hook to stop them.
+    throw new Error(
+      `Hook script missing at ${hookScriptSrc}. Check that cluster-hooks/ is listed in package.json "files".`
+    );
+  }
+
   // Ensure hooks directory exists
   if (!fs.existsSync(hooksDir)) {
     fs.mkdirSync(hooksDir, { recursive: true });
   }
 
-  // Copy hook script if not present or outdated
-  const hookScriptSrc = path.join(__dirname, '..', '..', 'hooks', hookScriptName);
-  if (fs.existsSync(hookScriptSrc)) {
-    // Always copy to ensure latest version
-    fs.copyFileSync(hookScriptSrc, hookScriptDst);
-    fs.chmodSync(hookScriptDst, 0o755);
-  }
+  // Always copy to ensure latest version
+  fs.copyFileSync(hookScriptSrc, hookScriptDst);
+  fs.chmodSync(hookScriptDst, 0o755);
 
   // Read existing settings or create new
   let settings = {};
@@ -464,19 +470,20 @@ function ensureAskUserQuestionHook(targetClaudeDir = null) {
     }
   }
 
-  // Ensure hooks structure exists
-  if (!settings.hooks) {
+  // Ensure hooks structure exists. A hand-edited settings.json can hold any
+  // shape here, and a throw would abort an otherwise healthy agent run.
+  if (!settings.hooks || typeof settings.hooks !== 'object') {
     settings.hooks = {};
   }
-  if (!settings.hooks.PreToolUse) {
+  if (!Array.isArray(settings.hooks.PreToolUse)) {
     settings.hooks.PreToolUse = [];
   }
 
   // Check if AskUserQuestion hook already exists
   const hasHook = settings.hooks.PreToolUse.some(
     (entry) =>
-      entry.matcher === 'AskUserQuestion' ||
-      (entry.hooks && entry.hooks.some((h) => h.command && h.command.includes(hookScriptName)))
+      entry?.matcher === 'AskUserQuestion' ||
+      entry?.hooks?.some?.((h) => h?.command && h.command.includes(hookScriptName))
   );
 
   if (!hasHook) {
@@ -518,18 +525,23 @@ function ensureDangerousGitHook(targetClaudeDir = null) {
   const hookScriptName = 'block-dangerous-git.py';
   const hookScriptDst = path.join(hooksDir, hookScriptName);
 
+  const hookScriptSrc = path.join(__dirname, '..', '..', 'cluster-hooks', hookScriptName);
+  if (!fs.existsSync(hookScriptSrc)) {
+    // Registering a command that will never exist is worse than failing here:
+    // worktree agents would run unguarded against dangerous git commands.
+    throw new Error(
+      `Hook script missing at ${hookScriptSrc}. Check that cluster-hooks/ is listed in package.json "files".`
+    );
+  }
+
   // Ensure hooks directory exists
   if (!fs.existsSync(hooksDir)) {
     fs.mkdirSync(hooksDir, { recursive: true });
   }
 
-  // Copy hook script if not present or outdated
-  const hookScriptSrc = path.join(__dirname, '..', '..', 'hooks', hookScriptName);
-  if (fs.existsSync(hookScriptSrc)) {
-    // Always copy to ensure latest version
-    fs.copyFileSync(hookScriptSrc, hookScriptDst);
-    fs.chmodSync(hookScriptDst, 0o755);
-  }
+  // Always copy to ensure latest version
+  fs.copyFileSync(hookScriptSrc, hookScriptDst);
+  fs.chmodSync(hookScriptDst, 0o755);
 
   // Read existing settings or create new
   let settings = {};
@@ -542,20 +554,20 @@ function ensureDangerousGitHook(targetClaudeDir = null) {
     }
   }
 
-  // Ensure hooks structure exists
-  if (!settings.hooks) {
+  // Ensure hooks structure exists. A hand-edited settings.json can hold any
+  // shape here, and a throw would abort an otherwise healthy agent run.
+  if (!settings.hooks || typeof settings.hooks !== 'object') {
     settings.hooks = {};
   }
-  if (!settings.hooks.PreToolUse) {
+  if (!Array.isArray(settings.hooks.PreToolUse)) {
     settings.hooks.PreToolUse = [];
   }
 
   // Check if dangerous git hook already exists
   const hasHook = settings.hooks.PreToolUse.some(
     (entry) =>
-      entry.matcher === 'Bash' &&
-      entry.hooks &&
-      entry.hooks.some((h) => h.command && h.command.includes(hookScriptName))
+      entry?.matcher === 'Bash' &&
+      entry.hooks?.some?.((h) => h?.command && h.command.includes(hookScriptName))
   );
 
   if (!hasHook) {
@@ -576,6 +588,94 @@ function ensureDangerousGitHook(targetClaudeDir = null) {
   }
 
   dangerousGitHookInstalledDirs.add(userClaudeDir);
+}
+
+/**
+ * Ensure the subagent tracking hook is installed in user's Claude config.
+ * Writes JSONL start/stop events that SubagentTracker/StatusFooter render.
+ * Modifies ~/.claude/settings.json and copies hook script to ~/.claude/hooks/
+ *
+ * Unlike the two hooks above this registers on two lifecycle events
+ * (SubagentStart + SubagentStop) rather than a single PreToolUse matcher.
+ *
+ * Safe to call multiple times - only modifies config once per process.
+ */
+function ensureSubagentTrackingHook(targetClaudeDir = null) {
+  const userClaudeDir =
+    targetClaudeDir || process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+  if (subagentTrackingHookInstalledDirs.has(userClaudeDir)) {
+    return;
+  }
+  const hooksDir = path.join(userClaudeDir, 'hooks');
+  const settingsPath = path.join(userClaudeDir, 'settings.json');
+  const hookScriptName = 'track-subagents.py';
+  const hookScriptDst = path.join(hooksDir, hookScriptName);
+
+  // Resolve via the real directory, not the repo's hooks -> cluster-hooks
+  // symlink: npm pack drops symlinks, so `hooks/` does not exist in an
+  // installed package.
+  const hookScriptSrc = path.join(__dirname, '..', '..', 'cluster-hooks', hookScriptName);
+  if (!fs.existsSync(hookScriptSrc)) {
+    // Registering a command that will never exist is worse than not tracking -
+    // Claude would try to run a missing file on every subagent spawn.
+    subagentTrackingHookInstalledDirs.add(userClaudeDir);
+    return;
+  }
+
+  // Ensure hooks directory exists
+  if (!fs.existsSync(hooksDir)) {
+    fs.mkdirSync(hooksDir, { recursive: true });
+  }
+
+  // Always copy to ensure latest version
+  fs.copyFileSync(hookScriptSrc, hookScriptDst);
+  fs.chmodSync(hookScriptDst, 0o755);
+
+  // Read existing settings or create new
+  let settings = {};
+  if (fs.existsSync(settingsPath)) {
+    try {
+      settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    } catch (e) {
+      console.warn(`[AgentTaskExecutor] Could not parse settings.json, creating new: ${e.message}`);
+      settings = {};
+    }
+  }
+
+  // Ensure hooks structure exists. A hand-edited settings.json can hold any
+  // shape here, and a throw would abort an otherwise healthy agent run.
+  if (!settings.hooks || typeof settings.hooks !== 'object') {
+    settings.hooks = {};
+  }
+
+  // Tracking needs both ends of the subagent lifecycle to render a live tree.
+  let changed = false;
+  for (const event of ['SubagentStart', 'SubagentStop']) {
+    if (!Array.isArray(settings.hooks[event])) {
+      settings.hooks[event] = [];
+    }
+    const hasHook = settings.hooks[event].some((entry) =>
+      entry?.hooks?.some?.((h) => h?.command && h.command.includes(hookScriptName))
+    );
+    if (!hasHook) {
+      settings.hooks[event].push({
+        hooks: [
+          {
+            type: 'command',
+            command: hookScriptDst,
+          },
+        ],
+      });
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+    console.log(`[AgentTaskExecutor] Installed subagent tracking hook in ${settingsPath}`);
+  }
+
+  subagentTrackingHookInstalledDirs.add(userClaudeDir);
 }
 
 /**
@@ -772,6 +872,9 @@ function ensureProviderHooks(agent, providerName, claudeConfigDir = null) {
   }
 
   ensureAskUserQuestionHook(claudeConfigDir);
+
+  // Producer side of the ZEROSHOT_TRACK_SUBAGENTS wiring in buildSpawnEnv()
+  ensureSubagentTrackingHook(claudeConfigDir);
 
   // WORKTREE MODE: Install git safety hook (blocks dangerous git commands)
   if (agent.worktree?.enabled) {
@@ -2072,6 +2175,8 @@ function killTask(agent) {
 
 module.exports = {
   ensureAskUserQuestionHook,
+  ensureDangerousGitHook,
+  ensureSubagentTrackingHook,
   spawnClaudeTask,
   followClaudeTaskLogs,
   waitForTaskReady,

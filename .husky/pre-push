@@ -1,5 +1,6 @@
 #!/bin/bash
-# Pre-push hook: Block direct pushes to main/dev + enforce PR workflow
+# Pre-push hook: block manual version tags, run the quality gate, keep .audit-ignore fresh.
+# Direct pushes to main/dev are intentionally allowed (solo fork) - see PART 1.
 
 set -e
 

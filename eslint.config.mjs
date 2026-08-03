@@ -321,6 +321,7 @@ export default [
   {
     ignores: [
       'node_modules/**',
+      '.fork-notes/**',
       'dist/**',
       'coverage/**',
       'cluster-hooks/**',
