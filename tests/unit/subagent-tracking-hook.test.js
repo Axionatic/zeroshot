@@ -164,6 +164,42 @@ describe('ensureAskUserQuestionHook / ensureDangerousGitHook', function () {
     const commands = commandsFor(readSettings(claudeDir), 'PreToolUse');
     expect(commands.some((c) => c && c.endsWith('block-dangerous-git.py'))).to.equal(true);
   });
+
+  const malformedTopLevelSettings = [null, [], 'text'];
+  const installers = [
+    {
+      name: 'AskUserQuestion blocker',
+      install: ensureAskUserQuestionHook,
+      event: 'PreToolUse',
+      script: 'block-ask-user-question.py',
+    },
+    {
+      name: 'dangerous-git blocker',
+      install: ensureDangerousGitHook,
+      event: 'PreToolUse',
+      script: 'block-dangerous-git.py',
+    },
+    {
+      name: 'subagent tracker',
+      install: ensureSubagentTrackingHook,
+      event: 'SubagentStart',
+      script: 'track-subagents.py',
+    },
+  ];
+
+  for (const { name, install, event, script } of installers) {
+    for (const malformedSettings of malformedTopLevelSettings) {
+      it(`${name} replaces top-level ${JSON.stringify(malformedSettings)} settings`, () => {
+        fs.writeFileSync(path.join(claudeDir, 'settings.json'), JSON.stringify(malformedSettings));
+
+        expect(() => install(claudeDir)).to.not.throw();
+
+        const written = readSettings(claudeDir);
+        expect(written).to.be.an('object').and.not.an('array');
+        expect(commandsFor(written, event)).to.deep.equal([path.join(claudeDir, 'hooks', script)]);
+      });
+    }
+  }
 });
 
 describe('track-subagents.py -> SubagentTracker contract', function () {

@@ -470,6 +470,10 @@ function ensureAskUserQuestionHook(targetClaudeDir = null) {
     }
   }
 
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+    settings = {};
+  }
+
   // Ensure hooks structure exists. A hand-edited settings.json can hold any
   // shape here, and a throw would abort an otherwise healthy agent run.
   if (!settings.hooks || typeof settings.hooks !== 'object') {
@@ -552,6 +556,10 @@ function ensureDangerousGitHook(targetClaudeDir = null) {
       console.warn(`[AgentTaskExecutor] Could not parse settings.json, creating new: ${e.message}`);
       settings = {};
     }
+  }
+
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+    settings = {};
   }
 
   // Ensure hooks structure exists. A hand-edited settings.json can hold any
@@ -640,6 +648,10 @@ function ensureSubagentTrackingHook(targetClaudeDir = null) {
       console.warn(`[AgentTaskExecutor] Could not parse settings.json, creating new: ${e.message}`);
       settings = {};
     }
+  }
+
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+    settings = {};
   }
 
   // Ensure hooks structure exists. A hand-edited settings.json can hold any
