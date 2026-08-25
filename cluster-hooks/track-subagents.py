@@ -20,11 +20,25 @@ def read_description_from_transcript(transcript_path):
         # Sleep briefly to let transcript flush
         time.sleep(0.5)
 
-        with open(transcript_path, "r") as f:
-            lines = f.readlines()
+        # Read backward until the final 20 JSONL records are available. This
+        # keeps normal transcript reads independent of the full session size.
+        chunks = []
+        newline_count = 0
+        with open(transcript_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            position = f.tell()
+            while position > 0 and newline_count <= 20:
+                read_size = min(8192, position)
+                position -= read_size
+                f.seek(position)
+                chunk = f.read(read_size)
+                chunks.append(chunk)
+                newline_count += chunk.count(b"\n")
 
-        # Search backward through last 20 lines for most recent Task tool_use
-        for line in reversed(lines[-20:]):
+        lines = b"".join(reversed(chunks)).decode("utf-8", errors="replace").splitlines()[-20:]
+
+        # Search backward for the most recent Task tool_use.
+        for line in reversed(lines):
             line = line.strip()
             if not line:
                 continue

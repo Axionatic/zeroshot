@@ -656,7 +656,7 @@ function ensureSubagentTrackingHook(targetClaudeDir = null) {
 
   // Ensure hooks structure exists. A hand-edited settings.json can hold any
   // shape here, and a throw would abort an otherwise healthy agent run.
-  if (!settings.hooks || typeof settings.hooks !== 'object') {
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
     settings.hooks = {};
   }
 

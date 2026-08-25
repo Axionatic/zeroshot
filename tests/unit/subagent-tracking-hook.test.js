@@ -111,6 +111,7 @@ describe('ensureSubagentTrackingHook', function () {
   // side errand of spawning an agent - it must never be what kills the run.
   const malformed = {
     'hooks is a string': { hooks: 'nope' },
+    'hooks is an array': { hooks: [] },
     'event value is not an array': { hooks: { SubagentStart: {} } },
     'entries are null': { hooks: { SubagentStart: [null], SubagentStop: [null] } },
     'entry.hooks is not an array': { hooks: { SubagentStart: [{ hooks: 'nope' }] } },
@@ -232,6 +233,75 @@ describe('track-subagents.py -> SubagentTracker contract', function () {
       },
     });
   }
+
+  it('reads the description from a bounded transcript tail', function () {
+    if (!python) return this.skip();
+
+    const probe = String.raw`
+import builtins
+import importlib.util
+import io
+import json
+import sys
+
+spec = importlib.util.spec_from_file_location("track_subagents", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.time.sleep = lambda _seconds: None
+
+description = "bounded tail description"
+entry = {
+    "type": "assistant",
+    "message": {"content": [{
+        "type": "tool_use",
+        "name": "Task",
+        "input": {"description": description},
+    }]},
+}
+old_prefix = b'{"type":"old"}\n' * 8192
+tail = (b'{"type":"recent"}\n' * 19) + json.dumps(entry).encode() + b'\n'
+transcript = old_prefix + tail
+earliest_allowed_offset = len(transcript) - 8192
+
+class TailOnlyFile:
+    def __init__(self):
+        self.stream = io.BytesIO(transcript)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def seek(self, *args):
+        return self.stream.seek(*args)
+
+    def tell(self):
+        return self.stream.tell()
+
+    def read(self, size=-1):
+        if self.stream.tell() < earliest_allowed_offset:
+            raise RuntimeError("attempted to read outside bounded tail")
+        return self.stream.read(size)
+
+    def readlines(self, *_args):
+        raise RuntimeError("attempted to read the full transcript")
+
+real_open = builtins.open
+builtins.open = lambda path, *args, **kwargs: (
+    TailOnlyFile() if path == "guarded-transcript" else real_open(path, *args, **kwargs)
+)
+
+print(module.read_description_from_transcript("guarded-transcript") or "")
+`;
+    const result = spawnSync(python, ['-c', probe, HOOK_SCRIPT], {
+      encoding: 'utf8',
+      env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
+    });
+
+    expect(result.status, result.stderr).to.equal(0);
+    expect(result.stdout.trim()).to.equal('bounded tail description');
+  });
 
   it('produces events a real SubagentTracker turns into active subagents', function () {
     if (!python) return this.skip();
