@@ -68,6 +68,52 @@ describe('isolated Claude subagent tracking handoff', () => {
     assert.strictEqual(receivedEnv.ZEROSHOT_TRACK_SUBAGENTS, '1');
     assert.strictEqual(receivedEnv.ZEROSHOT_SUBAGENT_EVENTS_FILE, eventsFile);
   });
+
+  it('keeps a Codex-default cluster event bind available for a Claude agent override', async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zs-isolated-config-'));
+    const manager = new IsolationManager();
+    let dockerArgs;
+    manager._getRunningContainerId = () => null;
+    manager._removeContainerByName = () => {};
+    manager._prepareIsolatedWorkspace = (_clusterId, workDir) => workDir;
+    manager._createClusterConfigDir = () => configDir;
+    manager._getDockerGid = () => '999';
+    manager._applyCredentialMounts = () => [];
+    manager._warnMissingProviderCredentials = () => {};
+    manager._spawnContainer = (_clusterId, args) => {
+      dockerArgs = args;
+      return 'container-id';
+    };
+    manager._watchContainerExit = () => {};
+
+    try {
+      await manager.createContainer(clusterId, { workDir: '/workspace-source', provider: 'codex' });
+      assert.ok(dockerArgs.includes(`${eventsDir}:${eventsDir}`));
+
+      manager.spawnInContainer = (_receivedClusterId, _command, { env }) => {
+        assert.strictEqual(fs.existsSync(eventsFile), true);
+        assert.strictEqual(env.ZEROSHOT_SUBAGENT_EVENTS_FILE, eventsFile);
+        throw new Error('stop after Codex-default handoff inspection');
+      };
+      const agent = {
+        id: agentId,
+        role: 'worker',
+        config: { outputFormat: 'text' },
+        isolation: { manager, clusterId },
+        _resolveProvider: () => 'claude',
+        _resolveModelSpec: () => ({ model: null }),
+        _selectModel: () => null,
+        _log: () => {},
+      };
+
+      await assert.rejects(
+        () => spawnClaudeTaskIsolated(agent, 'test context'),
+        /stop after Codex-default handoff inspection/
+      );
+    } finally {
+      fs.rmSync(configDir, { recursive: true, force: true });
+    }
+  });
 });
 
 (shouldRun ? describe : describe.skip)('Isolated Mode Output Capture', () => {

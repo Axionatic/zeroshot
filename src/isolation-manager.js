@@ -164,9 +164,15 @@ class IsolationManager {
     const clusterConfigDir = this._createClusterConfigDir(clusterId, containerHome);
     console.log(`[IsolationManager] Created cluster config dir at ${clusterConfigDir}`);
 
-    const subagentEventsDir = providerName === 'claude' ? getSubagentEventsDir(clusterId) : null;
-    if (subagentEventsDir) {
-      fs.mkdirSync(subagentEventsDir, { recursive: true });
+    const subagentEventsPath = getSubagentEventsDir(clusterId);
+    let subagentEventsDir = null;
+    try {
+      fs.mkdirSync(subagentEventsPath, { recursive: true });
+      subagentEventsDir = subagentEventsPath;
+    } catch (error) {
+      console.warn(
+        `[IsolationManager] Could not prepare subagent tracking directory: ${error.message}`
+      );
     }
 
     const args = this._buildBaseDockerArgs({

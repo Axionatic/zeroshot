@@ -23,8 +23,10 @@ const {
   ensureSubagentTrackingHook,
   ensureAskUserQuestionHook,
   ensureDangerousGitHook,
+  buildSpawnEnv,
 } = require('../../src/agent/agent-task-executor');
 const { SubagentTracker } = require('../../src/subagent-tracker');
+const { getSubagentEventsFile } = require('../../src/subagent-events');
 
 // Resolve the real directory, not the `hooks` symlink - same path the installer uses.
 const HOOK_SCRIPT = path.join(__dirname, '..', '..', 'cluster-hooks', 'track-subagents.py');
@@ -70,6 +72,19 @@ function writeParallelTranscript(transcriptPath) {
     },
   ];
   fs.writeFileSync(transcriptPath, entries.map((entry) => JSON.stringify(entry)).join('\n'));
+}
+
+function runTrackingHook(python, eventsFile, payload, env = {}) {
+  return spawnSync(python, [HOOK_SCRIPT], {
+    input: JSON.stringify(payload),
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      ZEROSHOT_TRACK_SUBAGENTS: '1',
+      ZEROSHOT_SUBAGENT_EVENTS_FILE: eventsFile,
+      ...env,
+    },
+  });
 }
 
 describe('ensureSubagentTrackingHook', function () {
@@ -251,19 +266,6 @@ describe('track-subagents.py -> SubagentTracker contract', function () {
     fs.rmSync(eventsDir, { recursive: true, force: true });
   });
 
-  function runHook(payload, env = {}) {
-    return spawnSync(python, [HOOK_SCRIPT], {
-      input: JSON.stringify(payload),
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        ZEROSHOT_TRACK_SUBAGENTS: '1',
-        ZEROSHOT_SUBAGENT_EVENTS_FILE: eventsFile,
-        ...env,
-      },
-    });
-  }
-
   it('uses the description from a single bounded transcript candidate', function () {
     if (!python) return this.skip();
 
@@ -340,7 +342,7 @@ print(module.read_description_from_transcript("guarded-transcript") or "")
     fs.mkdirSync(eventsDir, { recursive: true });
     writeParallelTranscript(transcriptPath);
 
-    const result = runHook({
+    const result = runTrackingHook(python, eventsFile, {
       hook_event_name: 'SubagentStart',
       agent_id: 'sub-a',
       agent_type: 'Explore',
@@ -359,8 +361,16 @@ print(module.read_description_from_transcript("guarded-transcript") or "")
   it('produces events a real SubagentTracker turns into active subagents', function () {
     if (!python) return this.skip();
 
-    runHook({ hook_event_name: 'SubagentStart', agent_id: 'sub-a', agent_type: 'Explore' });
-    runHook({ hook_event_name: 'SubagentStart', agent_id: 'sub-b', agent_type: 'Plan' });
+    runTrackingHook(python, eventsFile, {
+      hook_event_name: 'SubagentStart',
+      agent_id: 'sub-a',
+      agent_type: 'Explore',
+    });
+    runTrackingHook(python, eventsFile, {
+      hook_event_name: 'SubagentStart',
+      agent_id: 'sub-b',
+      agent_type: 'Plan',
+    });
 
     const tracker = new SubagentTracker(clusterId);
     tracker.poll();
@@ -371,7 +381,11 @@ print(module.read_description_from_transcript("guarded-transcript") or "")
     expect(active.map((s) => s.description)).to.deep.equal(['Explore', 'Plan']);
     expect(active.every((s) => typeof s.startedAt === 'number')).to.equal(true);
 
-    runHook({ hook_event_name: 'SubagentStop', agent_id: 'sub-a', agent_type: 'Explore' });
+    runTrackingHook(python, eventsFile, {
+      hook_event_name: 'SubagentStop',
+      agent_id: 'sub-a',
+      agent_type: 'Explore',
+    });
     tracker.poll();
 
     expect(tracker.getActiveSubagents(parentAgentId).map((s) => s.id)).to.deep.equal(['sub-b']);
@@ -380,11 +394,88 @@ print(module.read_description_from_transcript("guarded-transcript") or "")
   it('writes nothing unless ZEROSHOT_TRACK_SUBAGENTS is set', function () {
     if (!python) return this.skip();
 
-    runHook(
+    runTrackingHook(
+      python,
+      eventsFile,
       { hook_event_name: 'SubagentStart', agent_id: 'sub-a', agent_type: 'Explore' },
       { ZEROSHOT_TRACK_SUBAGENTS: '0' }
     );
 
     expect(fs.existsSync(eventsFile)).to.equal(false);
+  });
+});
+
+describe('track-subagents.py malformed telemetry', function () {
+  const python = spawnSync('python3', ['--version']).status === 0 ? 'python3' : null;
+  let eventsDir;
+  let eventsFile;
+
+  beforeEach(() => {
+    eventsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zs-hook-telemetry-'));
+    eventsFile = path.join(eventsDir, 'worker-1.jsonl');
+  });
+
+  afterEach(() => {
+    fs.rmSync(eventsDir, { recursive: true, force: true });
+  });
+
+  it('ignores valid JSON records with malformed nested transcript shapes', function () {
+    if (!python) return this.skip();
+
+    const transcriptPath = path.join(eventsDir, 'malformed-transcript.jsonl');
+    fs.writeFileSync(
+      transcriptPath,
+      [
+        JSON.stringify([]),
+        JSON.stringify({ type: 'assistant', message: [] }),
+        JSON.stringify({
+          type: 'assistant',
+          message: { content: [{ type: 'tool_use', input: [] }] },
+        }),
+      ].join('\n')
+    );
+
+    const result = runTrackingHook(python, eventsFile, {
+      hook_event_name: 'SubagentStart',
+      agent_id: 'sub-a',
+      agent_type: 'Explore',
+      transcript_path: transcriptPath,
+    });
+
+    expect(result.status, result.stderr).to.equal(0);
+    expect(JSON.parse(fs.readFileSync(eventsFile, 'utf8')).description).to.equal('Explore');
+  });
+
+  it('exits successfully without an event when storage is unavailable', function () {
+    if (!python) return this.skip();
+
+    const blockedDirectory = path.join(eventsDir, 'not-a-directory');
+    fs.writeFileSync(blockedDirectory, 'blocked');
+    const result = runTrackingHook(
+      python,
+      eventsFile,
+      { hook_event_name: 'SubagentStart', agent_id: 'sub-a', agent_type: 'Explore' },
+      { ZEROSHOT_SUBAGENT_EVENTS_FILE: path.join(blockedDirectory, 'events.jsonl') }
+    );
+
+    expect(result.status, result.stderr).to.equal(0);
+    expect(fs.existsSync(eventsFile)).to.equal(false);
+  });
+});
+
+describe('buildSpawnEnv subagent event path', function () {
+  it('uses the shared per-parent event-file contract for Claude', function () {
+    const clusterId = 'spawn-env-cluster';
+    const agent = {
+      id: 'worker-1',
+      cluster: { id: clusterId },
+      config: {},
+    };
+
+    const spawnEnv = buildSpawnEnv(agent, 'claude', null);
+
+    expect(spawnEnv.ZEROSHOT_SUBAGENT_EVENTS_FILE).to.equal(
+      getSubagentEventsFile(clusterId, agent.id)
+    );
   });
 });

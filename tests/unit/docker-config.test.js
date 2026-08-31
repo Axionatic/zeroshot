@@ -433,5 +433,41 @@ function registerSubagentTrackingIsolationTests() {
 
       assert.ok(args.includes(`${eventsDir}:${eventsDir}`));
     });
+
+    it('continues container setup when telemetry directory preparation fails', async function () {
+      const eventsDir = getSubagentEventsDir(clusterId);
+      const originalMkdirSync = fs.mkdirSync;
+      let capturedArgs;
+      manager._getRunningContainerId = () => null;
+      manager._removeContainerByName = () => {};
+      manager._prepareIsolatedWorkspace = (_clusterId, workDir) => workDir;
+      manager._createClusterConfigDir = () => configDir;
+      manager._getDockerGid = () => '999';
+      manager._applyCredentialMounts = () => [];
+      manager._warnMissingProviderCredentials = () => {};
+      manager._spawnContainer = (_clusterId, args) => {
+        capturedArgs = args;
+        return 'container-id';
+      };
+      manager._watchContainerExit = () => {};
+      fs.mkdirSync = (target, options) => {
+        if (target === eventsDir) {
+          throw new Error('telemetry directory unavailable');
+        }
+        return originalMkdirSync(target, options);
+      };
+
+      try {
+        const containerId = await manager.createContainer(clusterId, {
+          workDir: '/workspace-source',
+          provider: 'codex',
+        });
+        assert.strictEqual(containerId, 'container-id');
+      } finally {
+        fs.mkdirSync = originalMkdirSync;
+      }
+
+      assert.ok(!capturedArgs.includes(`${eventsDir}:${eventsDir}`));
+    });
   });
 }

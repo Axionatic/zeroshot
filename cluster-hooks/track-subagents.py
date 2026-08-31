@@ -49,11 +49,15 @@ def read_description_from_transcript(transcript_path):
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(entry, dict):
+                continue
 
             # Transcript format: {"type":"assistant","message":{"content":[...]}}
             content = None
             if entry.get("type") == "assistant":
-                content = entry.get("message", {}).get("content", [])
+                message = entry.get("message", {})
+                if isinstance(message, dict):
+                    content = message.get("content", [])
             elif isinstance(entry.get("content"), list):
                 content = entry["content"]
 
@@ -67,6 +71,8 @@ def read_description_from_transcript(transcript_path):
                     and item.get("name") in ("Agent", "Task")
                 ):
                     inp = item.get("input", {})
+                    if not isinstance(inp, dict):
+                        continue
                     desc = inp.get("description", "")
                     if desc:
                         descriptions.append(desc)
@@ -88,6 +94,8 @@ def main():
     try:
         input_data = json.load(sys.stdin)
     except json.JSONDecodeError:
+        sys.exit(0)
+    if not isinstance(input_data, dict):
         sys.exit(0)
 
     hook_event = input_data.get("hook_event_name", "")
@@ -124,10 +132,14 @@ def main():
         }
 
     if event:
-        # Ensure parent directory exists
-        os.makedirs(os.path.dirname(events_file), exist_ok=True)
-        with open(events_file, "a") as f:
-            f.write(json.dumps(event) + "\n")
+        try:
+            directory = os.path.dirname(events_file)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(events_file, "a") as f:
+                f.write(json.dumps(event) + "\n")
+        except (OSError, IOError):
+            pass
 
     sys.exit(0)
 

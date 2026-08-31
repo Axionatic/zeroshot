@@ -932,11 +932,9 @@ function buildSpawnEnv(agent, providerName, modelSpec, options = {}) {
 
     // SUBAGENT TRACKING: Activate hook that writes JSONL events for StatusFooter display
     spawnEnv.ZEROSHOT_TRACK_SUBAGENTS = '1';
-    spawnEnv.ZEROSHOT_SUBAGENT_EVENTS_FILE = path.join(
-      os.tmpdir(),
-      'zeroshot-subagents',
+    spawnEnv.ZEROSHOT_SUBAGENT_EVENTS_FILE = getSubagentEventsFile(
       agent.cluster?.id || 'unknown',
-      `${agent.id}.jsonl`
+      agent.id
     );
   }
 
@@ -2213,4 +2211,5 @@ module.exports = {
   killTask,
   // Exported for testing
   handleStatusCompletion,
+  buildSpawnEnv,
 };
