@@ -103,6 +103,9 @@ def main():
     agent_type = input_data.get("agent_type", "")
     transcript_path = input_data.get("transcript_path", "")
 
+    if not isinstance(transcript_path, str):
+        sys.exit(0)
+
     if not agent_id:
         sys.exit(0)
 

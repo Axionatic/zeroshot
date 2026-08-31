@@ -461,6 +461,22 @@ describe('track-subagents.py malformed telemetry', function () {
     expect(result.status, result.stderr).to.equal(0);
     expect(fs.existsSync(eventsFile)).to.equal(false);
   });
+
+  for (const transcriptPath of [[], {}]) {
+    it(`ignores a ${Array.isArray(transcriptPath) ? 'list' : 'object'} transcript_path payload`, function () {
+      if (!python) return this.skip();
+
+      const result = runTrackingHook(python, eventsFile, {
+        hook_event_name: 'SubagentStart',
+        agent_id: 'sub-a',
+        agent_type: 'Explore',
+        transcript_path: transcriptPath,
+      });
+
+      expect(result.status, result.stderr).to.equal(0);
+      expect(fs.existsSync(eventsFile)).to.equal(false);
+    });
+  }
 });
 
 describe('buildSpawnEnv subagent event path', function () {
