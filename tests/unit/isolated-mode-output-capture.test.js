@@ -11,9 +11,13 @@
  */
 
 const assert = require('assert');
+const { EventEmitter } = require('events');
 const Orchestrator = require('../../src/orchestrator');
 const IsolationManager = require('../../src/isolation-manager');
-const { spawnClaudeTaskIsolated } = require('../../src/agent/agent-task-executor');
+const {
+  followClaudeTaskLogsIsolated,
+  spawnClaudeTaskIsolated,
+} = require('../../src/agent/agent-task-executor');
 const { getSubagentEventsDir, getSubagentEventsFile } = require('../../src/subagent-events');
 const path = require('path');
 const fs = require('fs');
@@ -113,6 +117,137 @@ describe('isolated Claude subagent tracking handoff', () => {
     } finally {
       fs.rmSync(configDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('isolated Codex subagent observer lifecycle', function () {
+  this.timeout(5000);
+
+  const clusterId = `zs-isolated-codex-${process.pid}-${Math.random().toString(36).slice(2)}`;
+  const agentId = 'isolated-codex';
+  const eventsDir = getSubagentEventsDir(clusterId);
+  const eventsFile = getSubagentEventsFile(clusterId, agentId);
+
+  afterEach(() => {
+    fs.rmSync(eventsDir, { recursive: true, force: true });
+  });
+
+  it('drains the final stream-json records before finalizing active children', async () => {
+    const tailProcess = new EventEmitter();
+    tailProcess.stdout = new EventEmitter();
+    tailProcess.stderr = new EventEmitter();
+    tailProcess.kill = () => {};
+    const finalOutput = [
+      '{"type":"thread.started","thread_id":"root"}',
+      '{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["child-final"],"prompt":"Final drain"}}',
+      '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"ok\\":true}"}}',
+      '',
+    ].join('\n');
+    const manager = {
+      spawnInContainer: () => tailProcess,
+      execInContainer(_receivedClusterId, command) {
+        const shell = command[2];
+        if (shell.includes('get-log-path')) {
+          return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
+        }
+        if (shell.includes('zeroshot status')) {
+          return Promise.resolve({ code: 0, stdout: 'Status: completed\n', stderr: '' });
+        }
+        if (shell.includes('cat "')) {
+          return Promise.resolve({ code: 0, stdout: finalOutput, stderr: '' });
+        }
+        return Promise.reject(new Error(`unexpected command: ${shell}`));
+      },
+    };
+    const agent = {
+      id: agentId,
+      role: 'worker',
+      iteration: 1,
+      timeout: 0,
+      config: { outputFormat: 'stream-json' },
+      cluster: { id: clusterId },
+      isolation: { manager, clusterId },
+      messageBus: { publish: () => {} },
+      _resolveProvider: () => 'codex',
+      _parseResultOutput: () => Promise.resolve({ ok: true }),
+      _log: () => {},
+    };
+
+    const result = await followClaudeTaskLogsIsolated(agent, 'task-1');
+
+    assert.strictEqual(result.success, true);
+    const events = fs
+      .readFileSync(eventsFile, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.deepStrictEqual(
+      events.map(({ event, agent_id }) => ({ event, agent_id })),
+      [
+        { event: 'start', agent_id: 'child-final' },
+        { event: 'stop', agent_id: 'child-final' },
+      ]
+    );
+  });
+
+  it('finalizes active children before rejecting a Codex parse error', async () => {
+    const tailProcess = new EventEmitter();
+    tailProcess.stdout = new EventEmitter();
+    tailProcess.stderr = new EventEmitter();
+    tailProcess.kill = () => {};
+    const finalOutput = [
+      '{"type":"thread.started","thread_id":"root"}',
+      '{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["parse-child"],"prompt":"Parse failure"}}',
+      '{"type":"item.completed","item":{"type":"agent_message","text":"not-json"}}',
+      '',
+    ].join('\n');
+    const manager = {
+      spawnInContainer: () => tailProcess,
+      execInContainer(_receivedClusterId, command) {
+        const shell = command[2];
+        if (shell.includes('get-log-path')) {
+          return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
+        }
+        if (shell.includes('zeroshot status')) {
+          return Promise.resolve({ code: 0, stdout: 'Status: completed\n', stderr: '' });
+        }
+        if (shell.includes('cat "')) {
+          return Promise.resolve({ code: 0, stdout: finalOutput, stderr: '' });
+        }
+        return Promise.reject(new Error(`unexpected command: ${shell}`));
+      },
+    };
+    const agent = {
+      id: agentId,
+      role: 'worker',
+      iteration: 1,
+      timeout: 0,
+      config: { outputFormat: 'stream-json' },
+      cluster: { id: clusterId },
+      isolation: { manager, clusterId },
+      messageBus: { publish: () => {} },
+      _resolveProvider: () => 'codex',
+      _parseResultOutput: () => Promise.reject(new Error('invalid Codex result')),
+      _log: () => {},
+    };
+
+    await assert.rejects(
+      () => followClaudeTaskLogsIsolated(agent, 'task-parse-error'),
+      /invalid Codex result/
+    );
+
+    const events = fs
+      .readFileSync(eventsFile, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.deepStrictEqual(
+      events.map(({ event, agent_id }) => ({ event, agent_id })),
+      [
+        { event: 'start', agent_id: 'parse-child' },
+        { event: 'stop', agent_id: 'parse-child' },
+      ]
+    );
   });
 });
 
