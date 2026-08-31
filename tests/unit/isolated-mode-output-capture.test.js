@@ -454,7 +454,7 @@ describe('isolated Codex terminal settlement', function () {
     fs.rmSync(getSubagentEventsDir(codexLifecycleClusterId), { recursive: true, force: true });
   });
 
-  it('feeds only records not already observed by the live tail into final telemetry', async () => {
+  it('strips watcher epoch timestamps from live isolated telemetry', async () => {
     const probe = createObserverProbe();
     const tail = createTailProbe();
     const rootRecord = '{"type":"thread.started","thread_id":"root"}';
@@ -482,15 +482,15 @@ describe('isolated Codex terminal settlement', function () {
       observerOptions(probe)
     );
     await new Promise((resolve) => setTimeout(resolve, 5));
-    tail.process.stdout.emit('data', Buffer.from(`[${timestamp}]${rootRecord}\n`));
+    tail.process.stdout.emit('data', Buffer.from(finalOutput));
 
     await assert.rejects(() => taskPromise, /timeout after 30ms/);
 
     assert.deepStrictEqual(probe.sequence, [rootRecord, spawnRecord, 'finish']);
-    assert.deepStrictEqual(publishedLines, [rootRecord]);
+    assert.deepStrictEqual(publishedLines, [rootRecord, spawnRecord]);
   });
 
-  it('uses byte offsets when a live tail chunk splits a UTF-8 character', async () => {
+  it('preserves live telemetry when a tail chunk splits a UTF-8 character', async () => {
     const probe = createObserverProbe();
     const tail = createTailProbe();
     const rootRecord = '{"type":"thread.started","thread_id":"root"}';
@@ -526,15 +526,13 @@ describe('isolated Codex terminal settlement', function () {
     tail.process.stdout.emit('data', observedPrefix.subarray(emojiStart + 2));
 
     await assert.rejects(() => taskPromise, /timeout after 30ms/);
-    assert.ok(
-      probe.sequence.includes(spawnRecord),
-      'final drain should preserve the unseen record'
-    );
+    assert.ok(probe.sequence.includes(unicodeRecord), 'live decoding should preserve the record');
   });
 
   it('does not wait for a telemetry-only final read before rejecting a timeout', async () => {
     const probe = createObserverProbe();
     const tail = createTailProbe();
+    let finalReadCalls = 0;
     const manager = {
       spawnInContainer: () => tail.process,
       execInContainer(_receivedClusterId, command) {
@@ -545,6 +543,7 @@ describe('isolated Codex terminal settlement', function () {
         if (shell.includes('zeroshot status')) {
           return Promise.resolve({ code: 0, stdout: 'Status: running\n', stderr: '' });
         }
+        finalReadCalls++;
         return new Promise(() => {});
       },
     };
@@ -559,9 +558,10 @@ describe('isolated Codex terminal settlement', function () {
 
     assert.match(outcome, /timeout after 20ms/);
     assert.strictEqual(tail.probe.killCount, 1);
+    assert.strictEqual(finalReadCalls, 0);
   });
 
-  it('uses an observer-only final drain on the existing isolated timeout', async () => {
+  it('finalizes the observer without a container read on the existing isolated timeout', async () => {
     const probe = createObserverProbe();
     const tail = createTailProbe();
     const finalOutput = [
@@ -569,6 +569,7 @@ describe('isolated Codex terminal settlement', function () {
       '{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["timeout-child"],"prompt":"Timeout drain"}}',
       '',
     ].join('\n');
+    let finalReadCalls = 0;
     const manager = {
       spawnInContainer: () => tail.process,
       execInContainer(_receivedClusterId, command) {
@@ -579,6 +580,7 @@ describe('isolated Codex terminal settlement', function () {
         if (shell.includes('zeroshot status')) {
           return Promise.resolve({ code: 0, stdout: 'Status: running\n', stderr: '' });
         }
+        finalReadCalls++;
         return Promise.resolve({ code: 0, stdout: finalOutput, stderr: '' });
       },
     };
@@ -590,11 +592,8 @@ describe('isolated Codex terminal settlement', function () {
     );
 
     assert.strictEqual(probe.finishCount, 1);
-    assert.deepStrictEqual(probe.sequence, [
-      '{"type":"thread.started","thread_id":"root"}',
-      '{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["timeout-child"],"prompt":"Timeout drain"}}',
-      'finish',
-    ]);
+    assert.deepStrictEqual(probe.sequence, ['finish']);
+    assert.strictEqual(finalReadCalls, 0);
     assert.deepStrictEqual(publishedLines, []);
     assert.strictEqual(tail.probe.killCount, 1);
     assert.strictEqual(agent.currentTask, undefined);
@@ -632,11 +631,7 @@ describe('isolated Codex terminal settlement', function () {
 
     assert.ok(statusCalls > 2);
     assert.strictEqual(probe.finishCount, 1);
-    assert.deepStrictEqual(probe.sequence, [
-      '{"type":"thread.started","thread_id":"root"}',
-      '{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["retry-child"],"prompt":"Retry drain"}}',
-      'finish',
-    ]);
+    assert.deepStrictEqual(probe.sequence, ['finish']);
     assert.deepStrictEqual(publishedLines, []);
     assert.strictEqual(tail.probe.killCount, 1);
     assert.strictEqual(agent.currentTask, undefined);
@@ -698,11 +693,7 @@ describe('isolated Codex terminal settlement', function () {
     const result = await taskPromise;
 
     assert.strictEqual(snapshot.settled, false);
-    assert.deepStrictEqual(snapshot.sequence, [
-      '{"type":"thread.started","thread_id":"root"}',
-      '{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["kill-child"],"prompt":"Kill drain"}}',
-      'finish',
-    ]);
+    assert.deepStrictEqual(snapshot.sequence, ['finish']);
     assert.deepStrictEqual(snapshot.publishedLines, []);
     assert.strictEqual(snapshot.tailKills, 0);
     assert.strictEqual(result.success, true);

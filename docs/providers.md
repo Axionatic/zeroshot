@@ -77,6 +77,9 @@ credentials are missing).
 Cluster agents normally preserve intermediate provider output, so Codex
 collaboration events can be observed and reflected in the status footer. This
 best-effort telemetry never affects whether a provider task succeeds.
+It is unauthenticated, display-only status data—not an authorization or audit
+channel. In isolation mode the provider can write its own mounted telemetry
+file, so consumers must not use these records to make security decisions.
 
 The direct-task command below intentionally suppresses intermediate provider
 events, so log-observer tracking is unavailable for that run:

@@ -80,7 +80,7 @@ function runCodexSmoke({
       try {
         child.kill('SIGTERM');
       } catch {
-        resolveTimeout();
+        resolveTimeout({ detach: true });
         return;
       }
       killTimer = setTimeout(() => {
@@ -88,7 +88,7 @@ function runCodexSmoke({
         try {
           child.kill('SIGKILL');
         } catch {
-          resolveTimeout();
+          resolveTimeout({ detach: true });
           return;
         }
         detachTimer = setTimeout(() => resolveTimeout({ detach: true }), killGraceMs);

@@ -290,4 +290,28 @@ describe('Codex subagent smoke script', function () {
     assert.strictEqual(result.timedOut, true);
     assert.match(result.stderr, /timed out after 5ms/i);
   });
+
+  it('detaches when the provider child throws while being terminated', async function () {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    let unrefCount = 0;
+    child.kill = () => {
+      throw new Error('kill unavailable');
+    };
+    child.unref = () => {
+      unrefCount++;
+    };
+
+    const result = await runCodexSmoke({
+      eventsFile: '/tmp/not-used-by-provider-runner.jsonl',
+      onLine: () => {},
+      timeoutMs: 5,
+      killGraceMs: 5,
+      spawnProcess: () => child,
+    });
+
+    assert.strictEqual(result.code, 124);
+    assert.strictEqual(unrefCount, 1);
+  });
 });

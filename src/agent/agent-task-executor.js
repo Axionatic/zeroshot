@@ -1886,8 +1886,6 @@ function createIsolatedLogState() {
     timeoutHandle: null,
     lineBuffer: '',
     logFilePath: null,
-    tailBytesSeen: 0,
-    observedLineBytes: 0,
     tailDecoder: new StringDecoder('utf8'),
   };
 }
@@ -1970,12 +1968,6 @@ function startIsolatedTail({ agent, manager, clusterId, logFilePath, state, onLi
 
   state.tailProcess.stdout.on('data', (data) => {
     const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
-    const previousBytes = state.tailBytesSeen;
-    const lastNewline = buffer.lastIndexOf(0x0a);
-    if (lastNewline >= 0) {
-      state.observedLineBytes = previousBytes + lastNewline + 1;
-    }
-    state.tailBytesSeen += buffer.length;
     const chunk = state.tailDecoder.write(buffer);
     state.fullOutput += chunk;
     appendIsolatedContent(state, chunk, onLine);
@@ -2016,46 +2008,19 @@ async function drainIsolatedLog({ manager, clusterId, state, onLine }) {
   }
 }
 
-async function drainIsolatedObserver({ manager, clusterId, state, observer }) {
-  if (!observer) return;
-
-  let unseenContent = state.lineBuffer || '';
-  if (state.logFilePath) {
-    const finalReadResult = await manager.execInContainer(clusterId, [
-      'sh',
-      '-c',
-      `cat "${state.logFilePath}" 2>/dev/null || echo ""`,
-    ]);
-    if (finalReadResult.code === 0 && finalReadResult.stdout) {
-      const finalBuffer = Buffer.from(finalReadResult.stdout, 'utf8');
-      unseenContent = finalBuffer
-        .subarray(Math.min(state.observedLineBytes, finalBuffer.length))
-        .toString('utf8');
-    }
-  }
-
-  for (const line of unseenContent.split('\n')) {
-    if (!line.trim()) continue;
-    observeCodexLine(observer, parseIsolatedTimestampedLine(line).content);
-  }
-}
-
-function createIsolatedObserverFinalizer({ manager, clusterId, state, observer }) {
+function createIsolatedObserverFinalizer({ state, observer }) {
   let finalizationPromise = null;
-  return ({ drain = true } = {}) => {
+  return () => {
     if (finalizationPromise) return finalizationPromise;
-    finalizationPromise = (async () => {
-      if (drain) {
-        try {
-          await drainIsolatedObserver({ manager, clusterId, state, observer });
-        } catch {
-          // A final telemetry read is best effort.
-        }
+    try {
+      if (state.lineBuffer.trim()) {
+        observeCodexLine(observer, parseIsolatedTimestampedLine(state.lineBuffer).content);
       }
       finishCodexObserver(observer);
-    })().catch(() => {
+    } catch {
       finishCodexObserver(observer);
-    });
+    }
+    finalizationPromise = Promise.resolve();
     return finalizationPromise;
   };
 }
@@ -2081,7 +2046,7 @@ function createIsolatedFinalizer({
           // Preserve the existing result path when the final output read fails.
         }
       }
-      void observerFinalizer({ drain: !drainOutput });
+      void observerFinalizer();
       try {
         cleanup();
       } catch {
@@ -2234,14 +2199,9 @@ function followClaudeTaskLogsIsolated(agent, taskId, options = {}) {
       observerFactory
     );
     const onLine = (line) => broadcastIsolatedLine({ agent, providerName, taskId, line, observer });
-    const observerFinalizer = createIsolatedObserverFinalizer({
-      manager,
-      clusterId,
-      state,
-      observer,
-    });
+    const observerFinalizer = createIsolatedObserverFinalizer({ state, observer });
     const trackingCleanup = () => {
-      observerFinalizer({ drain: true }).catch(() => {});
+      observerFinalizer().catch(() => {});
     };
     if (observer) {
       agent._subagentTrackingCleanup = trackingCleanup;
