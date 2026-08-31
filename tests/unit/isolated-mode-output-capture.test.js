@@ -32,6 +32,71 @@ const claudeConfigDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(),
 const hasClaudeCredentials = fs.existsSync(path.join(claudeConfigDir, '.credentials.json'));
 
 const shouldRun = hasDocker && !isCI && hasImage && hasClaudeCredentials;
+const codexLifecycleClusterId = `zs-isolated-codex-${process.pid}-${Math.random().toString(36).slice(2)}`;
+const codexLifecycleAgentId = 'isolated-codex';
+
+function createTailProbe() {
+  const process = new EventEmitter();
+  process.stdout = new EventEmitter();
+  process.stderr = new EventEmitter();
+  const probe = { killCount: 0 };
+  process.kill = () => {
+    probe.killCount++;
+  };
+  return { process, probe };
+}
+
+function createObserverProbe() {
+  const sequence = [];
+  let finishCount = 0;
+  return {
+    observer: {
+      observeLine(line) {
+        sequence.push(line);
+      },
+      finishParent() {
+        finishCount++;
+        sequence.push('finish');
+      },
+    },
+    sequence,
+    get finishCount() {
+      return finishCount;
+    },
+  };
+}
+
+function createCodexAgent(manager, overrides = {}) {
+  const publishedLines = [];
+  const agent = {
+    id: codexLifecycleAgentId,
+    role: 'worker',
+    iteration: 1,
+    timeout: 0,
+    config: { outputFormat: 'stream-json' },
+    cluster: { id: codexLifecycleClusterId },
+    isolation: { manager, clusterId: codexLifecycleClusterId },
+    messageBus: {
+      publish(message) {
+        publishedLines.push(message.content.data.line);
+      },
+    },
+    _resolveProvider: () => 'codex',
+    _parseResultOutput: () => Promise.resolve({ ok: true }),
+    _log: () => {},
+    ...overrides,
+  };
+  return { agent, publishedLines };
+}
+
+function observerOptions(probe, overrides = {}) {
+  return {
+    observerFactory: () => probe.observer,
+    statusIntervalMs: 5,
+    maxStatusFailures: 2,
+    ...overrides,
+  };
+}
 
 describe('isolated Claude subagent tracking handoff', () => {
   const clusterId = `zs-isolated-exec-${process.pid}-${Math.random().toString(36).slice(2)}`;
@@ -123,8 +188,8 @@ describe('isolated Claude subagent tracking handoff', () => {
 describe('isolated Codex subagent observer lifecycle', function () {
   this.timeout(5000);
 
-  const clusterId = `zs-isolated-codex-${process.pid}-${Math.random().toString(36).slice(2)}`;
-  const agentId = 'isolated-codex';
+  const clusterId = codexLifecycleClusterId;
+  const agentId = codexLifecycleAgentId;
   const eventsDir = getSubagentEventsDir(clusterId);
   const eventsFile = getSubagentEventsFile(clusterId, agentId);
 
@@ -248,6 +313,241 @@ describe('isolated Codex subagent observer lifecycle', function () {
         { event: 'stop', agent_id: 'parse-child' },
       ]
     );
+  });
+});
+
+describe('isolated Codex setup settlement', function () {
+  this.timeout(5000);
+
+  afterEach(() => {
+    fs.rmSync(getSubagentEventsDir(codexLifecycleClusterId), { recursive: true, force: true });
+  });
+
+  it('finalizes once when get-log-path throws synchronously', async () => {
+    const probe = createObserverProbe();
+    const manager = {
+      execInContainer() {
+        throw new Error('sync get-log-path failure');
+      },
+    };
+    const { agent } = createCodexAgent(manager);
+
+    await assert.rejects(
+      () => followClaudeTaskLogsIsolated(agent, 'task-sync-log-path', observerOptions(probe)),
+      /sync get-log-path failure/
+    );
+
+    assert.strictEqual(probe.finishCount, 1);
+    assert.deepStrictEqual(probe.sequence, ['finish']);
+    assert.strictEqual(agent.currentTask, null);
+  });
+
+  it('finalizes once when get-log-path rejects asynchronously', async () => {
+    const probe = createObserverProbe();
+    const manager = {
+      execInContainer: () => Promise.reject(new Error('async get-log-path failure')),
+    };
+    const { agent } = createCodexAgent(manager);
+
+    await assert.rejects(
+      () => followClaudeTaskLogsIsolated(agent, 'task-async-log-path', observerOptions(probe)),
+      /async get-log-path failure/
+    );
+
+    assert.strictEqual(probe.finishCount, 1);
+    assert.deepStrictEqual(probe.sequence, ['finish']);
+    assert.strictEqual(agent.currentTask, null);
+  });
+
+  it('finalizes once for a non-zero get-log-path result', async () => {
+    const probe = createObserverProbe();
+    const manager = {
+      execInContainer: () => Promise.resolve({ code: 9, stdout: '', stderr: 'log lookup failed' }),
+    };
+    const { agent } = createCodexAgent(manager);
+
+    await assert.rejects(
+      () => followClaudeTaskLogsIsolated(agent, 'task-nonzero-log-path', observerOptions(probe)),
+      /log lookup failed/
+    );
+
+    assert.strictEqual(probe.finishCount, 1);
+    assert.deepStrictEqual(probe.sequence, ['finish']);
+    assert.strictEqual(agent.currentTask, null);
+  });
+
+  it('finalizes once for an empty get-log-path result', async () => {
+    const probe = createObserverProbe();
+    const manager = {
+      execInContainer: () => Promise.resolve({ code: 0, stdout: ' \n', stderr: '' }),
+    };
+    const { agent } = createCodexAgent(manager);
+
+    await assert.rejects(
+      () => followClaudeTaskLogsIsolated(agent, 'task-empty-log-path', observerOptions(probe)),
+      /Empty log path/
+    );
+
+    assert.strictEqual(probe.finishCount, 1);
+    assert.deepStrictEqual(probe.sequence, ['finish']);
+    assert.strictEqual(agent.currentTask, null);
+  });
+
+  it('installs kill before a pending get-log-path lookup and finalizes once', async () => {
+    const probe = createObserverProbe();
+    let lookupStarted = false;
+    const manager = {
+      execInContainer: () => {
+        lookupStarted = true;
+        return new Promise(() => {});
+      },
+    };
+    const { agent } = createCodexAgent(manager);
+
+    const resultPromise = followClaudeTaskLogsIsolated(
+      agent,
+      'task-pending-log-path',
+      observerOptions(probe)
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.strictEqual(lookupStarted, true);
+    assert.strictEqual(typeof agent.currentTask?.kill, 'function');
+    agent.currentTask.kill('killed during log lookup');
+
+    await assert.rejects(() => resultPromise, /killed during log lookup/);
+    assert.strictEqual(probe.finishCount, 1);
+    assert.deepStrictEqual(probe.sequence, ['finish']);
+    assert.strictEqual(agent.currentTask, null);
+  });
+});
+
+describe('isolated Codex terminal settlement', function () {
+  this.timeout(5000);
+
+  afterEach(() => {
+    fs.rmSync(getSubagentEventsDir(codexLifecycleClusterId), { recursive: true, force: true });
+  });
+
+  it('drains before timeout finalization and clears tail resources', async () => {
+    const probe = createObserverProbe();
+    const tail = createTailProbe();
+    const finalOutput = '{"type":"thread.started","thread_id":"root"}\n';
+    const manager = {
+      spawnInContainer: () => tail.process,
+      execInContainer(_receivedClusterId, command) {
+        const shell = command[2];
+        if (shell.includes('get-log-path')) {
+          return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
+        }
+        if (shell.includes('zeroshot status')) {
+          return Promise.resolve({ code: 0, stdout: 'Status: running\n', stderr: '' });
+        }
+        return Promise.resolve({ code: 0, stdout: finalOutput, stderr: '' });
+      },
+    };
+    const { agent } = createCodexAgent(manager, { timeout: 20 });
+
+    await assert.rejects(
+      () => followClaudeTaskLogsIsolated(agent, 'task-timeout', observerOptions(probe)),
+      /timeout after 20ms/
+    );
+
+    assert.strictEqual(probe.finishCount, 1);
+    assert.deepStrictEqual(probe.sequence, [finalOutput.trim(), 'finish']);
+    assert.strictEqual(tail.probe.killCount, 1);
+    assert.strictEqual(agent.currentTask, null);
+  });
+
+  it('drains before status-exhaustion finalization and stops further polling', async () => {
+    const probe = createObserverProbe();
+    const tail = createTailProbe();
+    const finalOutput = '{"type":"thread.started","thread_id":"root"}\n';
+    let statusCalls = 0;
+    const manager = {
+      spawnInContainer: () => tail.process,
+      execInContainer(_receivedClusterId, command) {
+        const shell = command[2];
+        if (shell.includes('get-log-path')) {
+          return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
+        }
+        if (shell.includes('zeroshot status')) {
+          statusCalls++;
+          return Promise.reject(new Error('isolated status unavailable'));
+        }
+        return Promise.resolve({ code: 0, stdout: finalOutput, stderr: '' });
+      },
+    };
+    const { agent } = createCodexAgent(manager, { timeout: 200 });
+
+    await assert.rejects(
+      () => followClaudeTaskLogsIsolated(agent, 'task-status-exhaustion', observerOptions(probe)),
+      /isolated status unavailable/
+    );
+    const callsAtSettlement = statusCalls;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    assert.strictEqual(callsAtSettlement, 2);
+    assert.strictEqual(statusCalls, callsAtSettlement);
+    assert.strictEqual(probe.finishCount, 1);
+    assert.deepStrictEqual(probe.sequence, [finalOutput.trim(), 'finish']);
+    assert.strictEqual(tail.probe.killCount, 1);
+    assert.strictEqual(agent.currentTask, null);
+  });
+
+  it('keeps Codex exhaustion and early kill semantics when observer construction fails', async () => {
+    let constructionAttempts = 0;
+    const observerFactory = () => {
+      constructionAttempts++;
+      throw new Error('observer unavailable');
+    };
+    const tail = createTailProbe();
+    const finalOutput = '{"type":"thread.started","thread_id":"root"}\n';
+    let statusCalls = 0;
+    const exhaustionManager = {
+      spawnInContainer: () => tail.process,
+      execInContainer(_receivedClusterId, command) {
+        const shell = command[2];
+        if (shell.includes('get-log-path')) {
+          return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
+        }
+        if (shell.includes('zeroshot status')) {
+          statusCalls++;
+          return Promise.reject(new Error('status failed without observer'));
+        }
+        return Promise.resolve({ code: 0, stdout: finalOutput, stderr: '' });
+      },
+    };
+    const exhaustedContext = createCodexAgent(exhaustionManager, { timeout: 200 });
+
+    await assert.rejects(
+      () =>
+        followClaudeTaskLogsIsolated(exhaustedContext.agent, 'task-null-observer-exhaustion', {
+          observerFactory,
+          statusIntervalMs: 5,
+          maxStatusFailures: 2,
+        }),
+      /status failed without observer/
+    );
+
+    const pendingManager = {
+      execInContainer: () => new Promise(() => {}),
+    };
+    const killedContext = createCodexAgent(pendingManager);
+    const killedPromise = followClaudeTaskLogsIsolated(
+      killedContext.agent,
+      'task-null-observer-kill',
+      { observerFactory, statusIntervalMs: 5, maxStatusFailures: 2 }
+    );
+    assert.strictEqual(typeof killedContext.agent.currentTask?.kill, 'function');
+    killedContext.agent.currentTask.kill('kill without observer');
+    await assert.rejects(() => killedPromise, /kill without observer/);
+
+    assert.strictEqual(constructionAttempts, 2);
+    assert.strictEqual(statusCalls, 2);
+    assert.deepStrictEqual(exhaustedContext.publishedLines, [finalOutput.trim()]);
+    assert.strictEqual(exhaustedContext.agent.currentTask, null);
+    assert.strictEqual(killedContext.agent.currentTask, null);
   });
 });
 

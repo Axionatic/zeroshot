@@ -1157,7 +1157,12 @@ function finishCodexObserver(observer) {
   }
 }
 
-function createCodexObserverForFollower(agent, providerName, clusterId = null) {
+function createCodexObserverForFollower(
+  agent,
+  providerName,
+  clusterId = null,
+  observerFactory = createCodexSubagentObserver
+) {
   if (providerName !== 'codex') return null;
   try {
     const resolvedClusterId =
@@ -1166,7 +1171,7 @@ function createCodexObserverForFollower(agent, providerName, clusterId = null) {
       agent.cluster_id ||
       process.env.ZEROSHOT_CLUSTER_ID ||
       'unknown';
-    return createCodexSubagentObserver({
+    return observerFactory({
       parentAgentId: agent.id,
       eventsFile: getSubagentEventsFile(resolvedClusterId, agent.id),
     });
@@ -1353,10 +1358,14 @@ async function buildCompletionResult({ agent, taskId, providerName, state, stdou
   };
 }
 
-function finalizeLogFollow(agent, state, { pollLogFile, onLine, observer } = {}) {
+function finalizeLogFollow(
+  agent,
+  state,
+  { pollLogFile, onLine, observer, drainFinalLine = false } = {}
+) {
   if (state.finalized) return;
   state.finalized = true;
-  if (observer) {
+  if (drainFinalLine) {
     try {
       pollLogFile?.();
     } catch {
@@ -1367,8 +1376,8 @@ function finalizeLogFollow(agent, state, { pollLogFile, onLine, observer } = {})
     } catch {
       // Output rendering errors must not strand observer cleanup.
     }
-    finishCodexObserver(observer);
   }
+  finishCodexObserver(observer);
   if (state.pollInterval) {
     clearInterval(state.pollInterval);
   }
@@ -1579,10 +1588,12 @@ function createLogFollower({
   initialLogFilePath,
   runStatusCommand = runCommandWithTimeout,
   maxStatusFailures = MAX_STATUS_FAILURES,
+  observerFactory = createCodexSubagentObserver,
 }) {
   return new Promise((resolve) => {
     const state = createLogFollowState();
-    const observer = createCodexObserverForFollower(agent, providerName);
+    const isCodex = providerName === 'codex';
+    const observer = createCodexObserverForFollower(agent, providerName, null, observerFactory);
 
     state.logFilePath =
       initialLogFilePath === undefined ? lookupLogFilePath(ctPath, taskId) : initialLogFilePath;
@@ -1609,6 +1620,7 @@ function createLogFollower({
         pollLogFile,
         onLine: broadcastLine,
         observer,
+        drainFinalLine: isCodex,
       });
 
     state.pollInterval = setInterval(pollLogFile, 300);
@@ -2114,6 +2126,8 @@ function startIsolatedStatusChecks({
   providerName,
   state,
   settler,
+  statusIntervalMs,
+  maxStatusFailures,
 }) {
   state.statusCheckInterval = setInterval(() => {
     checkIsolatedStatus({
@@ -2131,15 +2145,15 @@ function startIsolatedStatusChecks({
       agent._log(`[${agent.id}] Status check error (will retry): ${statusErr.message}`);
       if (
         settler.rejectOnStatusExhaustion &&
-        state.consecutiveStatusFailures >= MAX_STATUS_FAILURES
+        state.consecutiveStatusFailures >= maxStatusFailures
       ) {
         settler.reject(statusErr).catch(() => {});
       }
     });
-  }, 2000);
+  }, statusIntervalMs);
 }
 
-function installIsolatedTerminalControls({ agent, taskId, state, observer, settler }) {
+function installIsolatedTerminalControls({ agent, taskId, state, enableKill, settler }) {
   if (agent.timeout > 0) {
     state.timeoutHandle = setTimeout(() => {
       if (state.taskExited) return;
@@ -2149,7 +2163,7 @@ function installIsolatedTerminalControls({ agent, taskId, state, observer, settl
     }, agent.timeout);
   }
 
-  if (observer) {
+  if (enableKill) {
     agent.currentTask = {
       kill: (reason = 'Task killed') => {
         settler.reject(new Error(reason)).catch(() => {});
@@ -2158,7 +2172,7 @@ function installIsolatedTerminalControls({ agent, taskId, state, observer, settl
   }
 }
 
-function followClaudeTaskLogsIsolated(agent, taskId) {
+function followClaudeTaskLogsIsolated(agent, taskId, options = {}) {
   const { isolation } = agent;
   if (!isolation?.manager) {
     throw new Error('followClaudeTaskLogsIsolated: isolation manager not found');
@@ -2167,11 +2181,20 @@ function followClaudeTaskLogsIsolated(agent, taskId) {
   const manager = isolation.manager;
   const clusterId = isolation.clusterId;
   const providerName = agent._resolveProvider ? agent._resolveProvider() : 'claude';
+  const isCodex = providerName === 'codex';
+  const observerFactory = options.observerFactory || createCodexSubagentObserver;
+  const statusIntervalMs = options.statusIntervalMs || 2000;
+  const maxStatusFailures = options.maxStatusFailures || MAX_STATUS_FAILURES;
 
   return new Promise((resolve, reject) => {
     const state = createIsolatedLogState();
     const cleanup = buildIsolatedCleanup(state);
-    const observer = createCodexObserverForFollower(agent, providerName, clusterId);
+    const observer = createCodexObserverForFollower(
+      agent,
+      providerName,
+      clusterId,
+      observerFactory
+    );
     const onLine = (line) => broadcastIsolatedLine({ agent, providerName, taskId, line, observer });
     const finalize = createIsolatedFinalizer({
       agent,
@@ -2187,14 +2210,28 @@ function followClaudeTaskLogsIsolated(agent, taskId) {
       finalize,
       resolve,
       reject,
-      drainOnReject: !!observer,
-      rejectOnStatusExhaustion: !!observer,
-      rejectBuildErrors: !!observer,
+      drainOnReject: isCodex,
+      rejectOnStatusExhaustion: isCodex,
+      rejectBuildErrors: isCodex,
     });
+    if (isCodex) {
+      installIsolatedTerminalControls({
+        agent,
+        taskId,
+        state,
+        enableKill: true,
+        settler,
+      });
+    }
 
-    manager
-      .execInContainer(clusterId, ['sh', '-c', `zeroshot get-log-path ${taskId}`])
-      .then(({ stdout, stderr, code }) => {
+    Promise.resolve()
+      .then(() => {
+        if (state.taskExited) return null;
+        return manager.execInContainer(clusterId, ['sh', '-c', `zeroshot get-log-path ${taskId}`]);
+      })
+      .then((logPathResult) => {
+        if (state.taskExited) return;
+        const { stdout, stderr, code } = logPathResult;
         if (code !== 0) {
           settler
             .reject(
@@ -2233,9 +2270,19 @@ function followClaudeTaskLogsIsolated(agent, taskId) {
           providerName,
           state,
           settler,
+          statusIntervalMs,
+          maxStatusFailures,
         });
 
-        installIsolatedTerminalControls({ agent, taskId, state, observer, settler });
+        if (!isCodex) {
+          installIsolatedTerminalControls({
+            agent,
+            taskId,
+            state,
+            enableKill: false,
+            settler,
+          });
+        }
       })
       .catch((err) => {
         settler.reject(err).catch(() => {});

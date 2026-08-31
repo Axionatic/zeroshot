@@ -206,7 +206,7 @@ describe('normal Codex subagent observer lifecycle', function () {
       logFile,
       [
         '{"type":"thread.started","thread_id":"root"}',
-        `{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["${childId}"],"prompt":"Final normal drain"}}`,
+        `{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["${childId}"],"prompt":"Null observer drain"}}`,
       ].join('\n')
     );
   }
@@ -296,6 +296,122 @@ describe('normal Codex subagent observer lifecycle', function () {
       { event: 'start', agent_id: 'polling-child' },
       { event: 'stop', agent_id: 'polling-child' },
     ]);
+  });
+});
+
+describe('normal Codex lifecycle without an observer', function () {
+  this.timeout(5000);
+
+  const clusterId = `zs-normal-null-observer-${process.pid}-${Math.random().toString(36).slice(2)}`;
+  let tempDir;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(__dirname, '.zs-normal-follow-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+    fs.rmSync(getSubagentEventsDir(clusterId), { recursive: true, force: true });
+  });
+
+  function makeAgent() {
+    return {
+      id: 'normal-codex-without-observer',
+      role: 'worker',
+      iteration: 1,
+      quiet: true,
+      config: { outputFormat: 'json' },
+      cluster: { id: clusterId },
+      _publish: () => {},
+      _log: () => {},
+      _parseResultOutput: () => Promise.resolve({ ok: true }),
+      _stopLivenessCheck: () => {},
+    };
+  }
+
+  function writeFinalRecordWithoutNewline(logFile, childId) {
+    fs.writeFileSync(
+      logFile,
+      [
+        '{"type":"thread.started","thread_id":"root"}',
+        `{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["${childId}"],"prompt":"Final normal drain"}}`,
+      ].join('\n')
+    );
+  }
+
+  it('preserves Codex completion, exhaustion, and kill semantics when observer construction fails', async () => {
+    let constructionAttempts = 0;
+    const observerFactory = () => {
+      constructionAttempts++;
+      throw new Error('observer unavailable');
+    };
+
+    const completedLog = path.join(tempDir, 'completed.jsonl');
+    writeFinalRecordWithoutNewline(completedLog, 'completed-without-observer');
+    let parsedOutput = null;
+    const completedAgent = makeAgent();
+    completedAgent._parseResultOutput = (output) => {
+      parsedOutput = output;
+      return Promise.resolve({ ok: true });
+    };
+    const completed = await createLogFollower({
+      agent: completedAgent,
+      taskId: 'task-completed-without-observer',
+      fsModule: fs,
+      ctPath: 'unused-test-command',
+      providerName: 'codex',
+      observerFactory,
+      initialLogFilePath: completedLog,
+      runStatusCommand: (_command, _args, _options, callback) =>
+        callback(null, 'Status: completed\n', ''),
+    });
+
+    const exhaustedLog = path.join(tempDir, 'exhausted.jsonl');
+    writeFinalRecordWithoutNewline(exhaustedLog, 'exhausted-without-observer');
+    const originalConsoleError = console.error;
+    let exhausted;
+    try {
+      console.error = () => {};
+      exhausted = await createLogFollower({
+        agent: makeAgent(),
+        taskId: 'task-exhausted-without-observer',
+        fsModule: fs,
+        ctPath: 'unused-test-command',
+        providerName: 'codex',
+        observerFactory,
+        initialLogFilePath: exhaustedLog,
+        maxStatusFailures: 1,
+        runStatusCommand: (_command, _args, _options, callback) =>
+          callback(new Error('status unavailable'), '', 'offline'),
+      });
+    } finally {
+      console.error = originalConsoleError;
+    }
+
+    const killedLog = path.join(tempDir, 'killed-without-observer.jsonl');
+    writeFinalRecordWithoutNewline(killedLog, 'killed-without-observer');
+    const killedAgent = makeAgent();
+    const killedPromise = createLogFollower({
+      agent: killedAgent,
+      taskId: 'task-killed-without-observer',
+      fsModule: fs,
+      ctPath: 'unused-test-command',
+      providerName: 'codex',
+      observerFactory,
+      initialLogFilePath: killedLog,
+      runStatusCommand: (_command, _args, _options, callback) =>
+        callback(null, 'Status: running\n', ''),
+    });
+    killedAgent.currentTask.kill('manual kill without observer');
+    const killed = await killedPromise;
+
+    assert.strictEqual(completed.success, true);
+    assert.match(parsedOutput, /completed-without-observer/);
+    assert.match(completed.output, /completed-without-observer/);
+    assert.match(exhausted.output, /exhausted-without-observer/);
+    assert.strictEqual(killed.error, 'manual kill without observer');
+    assert.match(killed.output, /killed-without-observer/);
+    assert.strictEqual(constructionAttempts, 3);
   });
 });
 
