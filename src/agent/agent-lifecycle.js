@@ -216,7 +216,7 @@ async function stop(agent) {
   }
 
   // Kill current task if any
-  if (agent.currentTask) {
+  if (agent.currentTask || agent.currentTaskId) {
     agent._killTask();
   }
 

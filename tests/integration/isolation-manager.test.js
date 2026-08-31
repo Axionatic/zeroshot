@@ -295,7 +295,14 @@ describe('Codex subagent smoke script', function () {
     const child = new EventEmitter();
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
+    let stderrDestroyCount = 0;
     let unrefCount = 0;
+    child.stdout.destroy = () => {
+      throw new Error('stdout destroy unavailable');
+    };
+    child.stderr.destroy = () => {
+      stderrDestroyCount++;
+    };
     child.kill = () => {
       throw new Error('kill unavailable');
     };
@@ -312,6 +319,7 @@ describe('Codex subagent smoke script', function () {
     });
 
     assert.strictEqual(result.code, 124);
+    assert.strictEqual(stderrDestroyCount, 1);
     assert.strictEqual(unrefCount, 1);
   });
 });

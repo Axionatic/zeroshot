@@ -63,9 +63,17 @@ function runCodexSmoke({
       settled = true;
       clearTimers();
       if (detach) {
-        child.stdout?.destroy?.();
-        child.stderr?.destroy?.();
-        child.unref?.();
+        for (const cleanup of [
+          () => child.stdout?.destroy?.(),
+          () => child.stderr?.destroy?.(),
+          () => child.unref?.(),
+        ]) {
+          try {
+            cleanup();
+          } catch {
+            // Timeout settlement must not depend on best-effort child cleanup.
+          }
+        }
       }
       resolve({
         code: 124,
