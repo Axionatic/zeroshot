@@ -72,6 +72,31 @@ Mount presets in `dockerMounts` include: `codex`, `gemini`, `gcloud`, `claude`, 
 Use `--no-mounts` to disable all credential mounts (you will get a warning if
 credentials are missing).
 
+## Subagent Telemetry Reliability
+
+Cluster agents normally preserve intermediate provider output, so Codex
+collaboration events can be observed and reflected in the status footer. This
+best-effort telemetry never affects whether a provider task succeeds.
+
+The direct-task command below intentionally suppresses intermediate provider
+events, so log-observer tracking is unavailable for that run:
+
+```bash
+zeroshot task run --output-format json --json-schema '…' --silent-json-output 'prompt'
+```
+
+The default cluster-agent path does not enable `--silent-json-output`. Some
+Codex releases also omit successful collaboration events; a completed run with
+zero telemetry records is an expected, reported outcome.
+
+To safely check the installed Codex CLI's telemetry behavior, run the opt-in
+smoke test. It prints the Codex version and reports observed or unavailable
+collaboration telemetry without treating zero records as a failure:
+
+```bash
+CODEX_SUBAGENT_SMOKE=1 node scripts/smoke-codex-subagents.js
+```
+
 ## Provider CLI Helper
 
 Provider command construction, feature probing, model resolution, output
