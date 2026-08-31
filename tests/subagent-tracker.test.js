@@ -110,6 +110,57 @@ describe('SubagentTracker', () => {
     assert.strictEqual(active[1].id, 'sub-2');
   });
 
+  it('retains a split record until its final newline arrives', () => {
+    const tracker = new SubagentTracker(TEST_CLUSTER_ID);
+    const filePath = path.join(BASE_DIR, 'analyst.jsonl');
+    fs.mkdirSync(BASE_DIR, { recursive: true });
+    const event = JSON.stringify({
+      event: 'start',
+      agent_id: 'sub-1',
+      description: 'Split',
+      ts: 1000,
+    });
+    fs.writeFileSync(filePath, event.slice(0, -3));
+
+    tracker.poll();
+    assert.deepStrictEqual(tracker.getActiveSubagents('analyst'), []);
+
+    fs.appendFileSync(filePath, `${event.slice(-3)}\n`);
+    tracker.poll();
+    assert.deepStrictEqual(
+      tracker.getActiveSubagents('analyst').map((s) => s.id),
+      ['sub-1']
+    );
+  });
+
+  it('deduplicates duplicate starts for an active parent-child pair', () => {
+    const tracker = new SubagentTracker(TEST_CLUSTER_ID);
+
+    writeEvents('analyst', [
+      { event: 'start', agent_id: 'sub-1', description: 'First', ts: 1000 },
+      { event: 'start', agent_id: 'sub-1', description: 'Duplicate', ts: 2000 },
+    ]);
+
+    tracker.poll();
+    assert.strictEqual(tracker.getActiveSubagents('analyst').length, 1);
+    assert.strictEqual(tracker.getActiveSubagents('analyst')[0].description, 'First');
+  });
+
+  it('supports a child stopping and starting again', () => {
+    const tracker = new SubagentTracker(TEST_CLUSTER_ID);
+
+    writeEvents('analyst', [
+      { event: 'start', agent_id: 'sub-1', description: 'First', ts: 1000 },
+      { event: 'stop', agent_id: 'sub-1', ts: 2000 },
+      { event: 'start', agent_id: 'sub-1', description: 'Second', ts: 3000 },
+    ]);
+
+    tracker.poll();
+    assert.deepStrictEqual(tracker.getActiveSubagents('analyst'), [
+      { id: 'sub-1', description: 'Second', startedAt: 3000 },
+    ]);
+  });
+
   it('cleanup() removes directory', () => {
     const tracker = new SubagentTracker(TEST_CLUSTER_ID);
 

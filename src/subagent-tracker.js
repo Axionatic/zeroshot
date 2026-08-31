@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
+const { getSubagentEventsDir } = require('./subagent-events');
 
 class SubagentTracker {
   /**
@@ -11,7 +11,7 @@ class SubagentTracker {
    * @param {string} clusterId - Cluster ID to track
    */
   constructor(clusterId) {
-    this.baseDir = path.join(os.tmpdir(), 'zeroshot-subagents', clusterId);
+    this.baseDir = getSubagentEventsDir(clusterId);
     // agentId -> [{id, description, startedAt}]
     this.active = new Map();
     // filePath -> byte offset (avoids re-reading entire file each poll)
@@ -66,9 +66,13 @@ class SubagentTracker {
       return;
     }
 
-    this.offsets.set(filePath, stat.size);
+    const finalNewline = chunk.lastIndexOf('\n');
+    if (finalNewline === -1) return; // Wait for a complete JSONL record.
 
-    for (const line of chunk.split('\n')) {
+    const completeChunk = chunk.slice(0, finalNewline + 1);
+    this.offsets.set(filePath, offset + Buffer.byteLength(completeChunk, 'utf8'));
+
+    for (const line of completeChunk.split('\n')) {
       if (!line.trim()) continue;
       let event;
       try {
@@ -93,6 +97,7 @@ class SubagentTracker {
     const list = this.active.get(agentId);
 
     if (event.event === 'start') {
+      if (list.some((subagent) => subagent.id === event.agent_id)) return;
       list.push({
         id: event.agent_id,
         description: event.description || event.agent_type || 'subagent',
