@@ -91,6 +91,7 @@ function runCodexSmoke({
         resolveTimeout({ detach: true });
         return;
       }
+      if (settled) return;
       killTimer = setTimeout(() => {
         if (settled) return;
         try {
@@ -114,7 +115,7 @@ function runCodexSmoke({
     child.on('error', (error) => {
       if (settled) return;
       if (timedOut) {
-        resolveTimeout();
+        resolveTimeout({ detach: true });
         return;
       }
       settled = true;

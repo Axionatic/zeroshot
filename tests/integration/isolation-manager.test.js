@@ -322,4 +322,39 @@ describe('Codex subagent smoke script', function () {
     assert.strictEqual(stderrDestroyCount, 1);
     assert.strictEqual(unrefCount, 1);
   });
+
+  it('detaches when signalling the timed-out provider emits an error', async function () {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    let stdoutDestroyCount = 0;
+    let stderrDestroyCount = 0;
+    let unrefCount = 0;
+    child.stdout.destroy = () => {
+      stdoutDestroyCount++;
+    };
+    child.stderr.destroy = () => {
+      stderrDestroyCount++;
+    };
+    child.kill = () => {
+      child.emit('error', Object.assign(new Error('operation not permitted'), { code: 'EPERM' }));
+      return false;
+    };
+    child.unref = () => {
+      unrefCount++;
+    };
+
+    const result = await runCodexSmoke({
+      eventsFile: '/tmp/not-used-by-provider-runner.jsonl',
+      onLine: () => {},
+      timeoutMs: 5,
+      killGraceMs: 50,
+      spawnProcess: () => child,
+    });
+
+    assert.strictEqual(result.code, 124);
+    assert.strictEqual(stdoutDestroyCount, 1);
+    assert.strictEqual(stderrDestroyCount, 1);
+    assert.strictEqual(unrefCount, 1);
+  });
 });

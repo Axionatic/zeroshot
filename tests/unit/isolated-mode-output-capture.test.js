@@ -359,7 +359,7 @@ describe('isolated Codex setup settlement', function () {
 
     assert.strictEqual(probe.finishCount, 1);
     assert.deepStrictEqual(probe.sequence, ['finish']);
-    assert.strictEqual(agent.currentTask, undefined);
+    assert.strictEqual(agent.currentTask, null);
   });
 
   it('finalizes once when get-log-path rejects asynchronously', async () => {
@@ -376,7 +376,7 @@ describe('isolated Codex setup settlement', function () {
 
     assert.strictEqual(probe.finishCount, 1);
     assert.deepStrictEqual(probe.sequence, ['finish']);
-    assert.strictEqual(agent.currentTask, undefined);
+    assert.strictEqual(agent.currentTask, null);
   });
 
   it('finalizes once for a non-zero get-log-path result', async () => {
@@ -393,7 +393,7 @@ describe('isolated Codex setup settlement', function () {
 
     assert.strictEqual(probe.finishCount, 1);
     assert.deepStrictEqual(probe.sequence, ['finish']);
-    assert.strictEqual(agent.currentTask, undefined);
+    assert.strictEqual(agent.currentTask, null);
   });
 
   it('finalizes once for an empty get-log-path result', async () => {
@@ -410,10 +410,10 @@ describe('isolated Codex setup settlement', function () {
 
     assert.strictEqual(probe.finishCount, 1);
     assert.deepStrictEqual(probe.sequence, ['finish']);
-    assert.strictEqual(agent.currentTask, undefined);
+    assert.strictEqual(agent.currentTask, null);
   });
 
-  it('does not add Codex-only kill or timeout settlement while log lookup is pending', async () => {
+  it('installs provider-neutral kill handling while log lookup is pending', async () => {
     const probe = createObserverProbe();
     let lookupStarted = false;
     const manager = {
@@ -441,7 +441,7 @@ describe('isolated Codex setup settlement', function () {
       new Promise((resolve) => setTimeout(() => resolve('pending'), 40)),
     ]);
 
-    assert.strictEqual(hasCustomKill, false);
+    assert.strictEqual(hasCustomKill, true);
     assert.strictEqual(outcome, 'pending');
     assert.strictEqual(probe.finishCount, 0);
   });
@@ -596,7 +596,7 @@ describe('isolated Codex terminal settlement', function () {
     assert.strictEqual(finalReadCalls, 0);
     assert.deepStrictEqual(publishedLines, []);
     assert.strictEqual(tail.probe.killCount, 1);
-    assert.strictEqual(agent.currentTask, undefined);
+    assert.strictEqual(agent.currentTask, null);
   });
 
   it('keeps retrying status errors until the existing provider-neutral timeout', async () => {
@@ -634,10 +634,10 @@ describe('isolated Codex terminal settlement', function () {
     assert.deepStrictEqual(probe.sequence, ['finish']);
     assert.deepStrictEqual(publishedLines, []);
     assert.strictEqual(tail.probe.killCount, 1);
-    assert.strictEqual(agent.currentTask, undefined);
+    assert.strictEqual(agent.currentTask, null);
   });
 
-  it('lets killTask clean up telemetry without defining isolated task settlement', async () => {
+  it('kills and settles an isolated task while leaving its container available', async () => {
     const probe = createObserverProbe();
     const tail = createTailProbe();
     const finalOutput = [
@@ -646,9 +646,14 @@ describe('isolated Codex terminal settlement', function () {
       '',
     ].join('\n');
     let terminal = false;
+    const killCommands = [];
     const manager = {
       spawnInContainer: () => tail.process,
       execInContainer(_receivedClusterId, command) {
+        if (command[0] === 'zeroshot' && command[1] === 'kill') {
+          killCommands.push(command);
+          return Promise.resolve({ code: 0, stdout: 'killed\n', stderr: '' });
+        }
         const shell = command[2];
         if (shell.includes('get-log-path')) {
           return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
@@ -664,6 +669,7 @@ describe('isolated Codex terminal settlement', function () {
       },
     };
     const { agent, publishedLines } = createCodexAgent(manager);
+    agent.currentTaskId = 'task-kill-cleanup';
     let settled = false;
     const taskPromise = followClaudeTaskLogsIsolated(
       agent,
@@ -680,8 +686,7 @@ describe('isolated Codex terminal settlement', function () {
     );
     await new Promise((resolve) => setTimeout(resolve, 10));
 
-    killTask(agent);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await killTask(agent);
     const snapshot = {
       settled,
       sequence: [...probe.sequence],
@@ -692,11 +697,12 @@ describe('isolated Codex terminal settlement', function () {
     terminal = true;
     const result = await taskPromise;
 
-    assert.strictEqual(snapshot.settled, false);
+    assert.strictEqual(snapshot.settled, true);
     assert.deepStrictEqual(snapshot.sequence, ['finish']);
     assert.deepStrictEqual(snapshot.publishedLines, []);
-    assert.strictEqual(snapshot.tailKills, 0);
-    assert.strictEqual(result.success, true);
+    assert.strictEqual(snapshot.tailKills, 1);
+    assert.deepStrictEqual(killCommands, [['zeroshot', 'kill', 'task-kill-cleanup']]);
+    assert.strictEqual(result.success, false);
   });
 });
 

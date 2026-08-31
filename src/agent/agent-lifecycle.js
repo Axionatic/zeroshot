@@ -217,7 +217,7 @@ async function stop(agent) {
 
   // Kill current task if any
   if (agent.currentTask || agent.currentTaskId) {
-    agent._killTask();
+    await agent._killTask();
   }
 
   // Wait for in-flight execution to complete (up to 5 seconds)
@@ -965,7 +965,7 @@ async function executeTask(agent, triggeringMessage) {
       sigtermRetryGranted = updated.sigtermRetryGranted;
       noMessagesRetryGranted = updated.noMessagesRetryGranted;
       // Kill orphan task before retry — prevents accumulating zombie processes
-      killTask(agent);
+      await killTask(agent);
       agent.processPid = null;
 
       const shouldStop = await handleTaskAttemptFailure({
