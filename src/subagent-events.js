@@ -11,8 +11,13 @@ function getSubagentEventsFile(clusterId, parentAgentId) {
 }
 
 function appendSubagentEvent(filePath, event) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.appendFileSync(filePath, `${JSON.stringify(event)}\n`);
+  try {
+    const record = `${JSON.stringify(event)}\n`;
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.appendFileSync(filePath, record);
+  } catch {
+    // Event tracking is best-effort telemetry and must never affect execution.
+  }
 }
 
 module.exports = {

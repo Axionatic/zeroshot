@@ -33,4 +33,25 @@ describe('subagent event helpers', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('does not throw when an event cannot be serialized', () => {
+    const event = {};
+    event.self = event;
+
+    assert.doesNotThrow(() => appendSubagentEvent('/tmp/unreachable-events.jsonl', event));
+  });
+
+  it('does not throw when the event file cannot be written', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'subagent-events-'));
+    const parentFile = path.join(root, 'not-a-directory');
+    fs.writeFileSync(parentFile, 'file');
+
+    try {
+      assert.doesNotThrow(() =>
+        appendSubagentEvent(path.join(parentFile, 'events.jsonl'), { event: 'stop' })
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
