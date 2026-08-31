@@ -9,6 +9,10 @@
  */
 
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
+const IsolationManager = require('../../src/isolation-manager');
+const { getSubagentEventsDir } = require('../../src/subagent-events');
 const {
   MOUNT_PRESETS,
   ENV_PRESETS,
@@ -29,6 +33,7 @@ describe('Docker Configuration', function () {
   registerValidateEnvPassthroughTests();
   registerAwsWorkflowTests();
   registerCustomMountWorkflowTests();
+  registerSubagentTrackingIsolationTests();
 });
 
 function registerMountPresetTests() {
@@ -380,6 +385,53 @@ function registerCustomMountWorkflowTests() {
       assert.strictEqual(mounts[1].host, '~/.myapp');
       assert.strictEqual(mounts[1].container, '/home/node/.myapp');
       assert.strictEqual(mounts[1].readonly, false);
+    });
+  });
+}
+
+function registerSubagentTrackingIsolationTests() {
+  describe('isolated Claude subagent tracking', function () {
+    const containerHome = '/home/claude';
+    let clusterId;
+    let manager;
+    let configDir;
+
+    beforeEach(function () {
+      clusterId = `zs-isolated-hooks-${process.pid}-${Math.random().toString(36).slice(2)}`;
+      manager = new IsolationManager();
+      configDir = manager._createClusterConfigDir(clusterId, containerHome);
+    });
+
+    afterEach(function () {
+      manager._cleanupClusterConfigDir(clusterId);
+      fs.rmSync(getSubagentEventsDir(clusterId), { recursive: true, force: true });
+    });
+
+    it('installs both subagent lifecycle hooks in the isolated Claude config', function () {
+      const settings = JSON.parse(fs.readFileSync(path.join(configDir, 'settings.json'), 'utf8'));
+      const commandFor = (event) => settings.hooks[event][0].hooks[0].command;
+
+      assert.strictEqual(
+        commandFor('SubagentStart'),
+        `${containerHome}/.claude/hooks/track-subagents.py`
+      );
+      assert.strictEqual(
+        commandFor('SubagentStop'),
+        `${containerHome}/.claude/hooks/track-subagents.py`
+      );
+    });
+
+    it('mounts the writable cluster event directory into the isolated container', function () {
+      const eventsDir = getSubagentEventsDir(clusterId);
+      const args = manager._buildBaseDockerArgs({
+        containerName: `zeroshot-cluster-${clusterId}`,
+        workDir: '/workspace-source',
+        containerHome,
+        clusterConfigDir: configDir,
+        subagentEventsDir: eventsDir,
+      });
+
+      assert.ok(args.includes(`${eventsDir}:${eventsDir}`));
     });
   });
 }

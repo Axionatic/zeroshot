@@ -21,6 +21,7 @@ const { resolveClaudeAuth } = require('../../lib/settings/claude-auth.js');
 const { prependWorktreeToolBinToEnv } = require('../worktree-tooling-env.js');
 const { prepareClaudeConfigDir } = require('../worktree-claude-config.js');
 const { buildRawLogOnlyMetadata } = require('./context-replay-policy');
+const { getSubagentEventsFile } = require('../subagent-events');
 
 function runCommandWithTimeout(command, args, options = {}, callback = null) {
   const timeout = options.timeout ?? 30000;
@@ -1640,6 +1641,17 @@ async function spawnClaudeTaskIsolated(agent, context) {
   // Note: Auth env vars are injected by IsolationManager, we only need model mapping here
   const isolatedEnv =
     providerName === 'claude' ? buildClaudeEnv(modelSpec, { includeAuth: false }) : {};
+  if (providerName === 'claude') {
+    const eventsFile = getSubagentEventsFile(clusterId, agent.id);
+    isolatedEnv.ZEROSHOT_TRACK_SUBAGENTS = '1';
+    isolatedEnv.ZEROSHOT_SUBAGENT_EVENTS_FILE = eventsFile;
+    try {
+      fs.mkdirSync(path.dirname(eventsFile), { recursive: true });
+      fs.closeSync(fs.openSync(eventsFile, 'a'));
+    } catch (error) {
+      agent._log(`⚠️ Agent ${agent.id}: Could not prepare subagent tracking: ${error.message}`);
+    }
+  }
 
   const taskId = await new Promise((resolve, reject) => {
     const proc = manager.spawnInContainer(clusterId, command, {

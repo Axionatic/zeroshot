@@ -42,6 +42,36 @@ function commandsFor(settings, event) {
   });
 }
 
+function writeParallelTranscript(transcriptPath) {
+  const entries = [
+    {
+      type: 'assistant',
+      message: {
+        content: [
+          {
+            type: 'tool_use',
+            name: 'Task',
+            input: { description: 'first parallel task' },
+          },
+        ],
+      },
+    },
+    {
+      type: 'assistant',
+      message: {
+        content: [
+          {
+            type: 'tool_use',
+            name: 'Agent',
+            input: { description: 'second parallel task' },
+          },
+        ],
+      },
+    },
+  ];
+  fs.writeFileSync(transcriptPath, entries.map((entry) => JSON.stringify(entry)).join('\n'));
+}
+
 describe('ensureSubagentTrackingHook', function () {
   let claudeDir;
 
@@ -234,7 +264,7 @@ describe('track-subagents.py -> SubagentTracker contract', function () {
     });
   }
 
-  it('reads the description from a bounded transcript tail', function () {
+  it('uses the description from a single bounded transcript candidate', function () {
     if (!python) return this.skip();
 
     const probe = String.raw`
@@ -301,6 +331,29 @@ print(module.read_description_from_transcript("guarded-transcript") or "")
 
     expect(result.status, result.stderr).to.equal(0);
     expect(result.stdout.trim()).to.equal('bounded tail description');
+  });
+
+  it('falls back to agent_type when parallel transcript candidates cannot be correlated', function () {
+    if (!python) return this.skip();
+
+    const transcriptPath = path.join(eventsDir, 'parallel-transcript.jsonl');
+    fs.mkdirSync(eventsDir, { recursive: true });
+    writeParallelTranscript(transcriptPath);
+
+    const result = runHook({
+      hook_event_name: 'SubagentStart',
+      agent_id: 'sub-a',
+      agent_type: 'Explore',
+      transcript_path: transcriptPath,
+    });
+
+    expect(result.status, result.stderr).to.equal(0);
+    const [event] = fs
+      .readFileSync(eventsFile, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    expect(event.description).to.equal('Explore');
   });
 
   it('produces events a real SubagentTracker turns into active subagents', function () {

@@ -37,7 +37,10 @@ def read_description_from_transcript(transcript_path):
 
         lines = b"".join(reversed(chunks)).decode("utf-8", errors="replace").splitlines()[-20:]
 
-        # Search backward for the most recent Task tool_use.
+        # A transcript can contain Task calls from parallel subagents. The hook
+        # payload has no Task tool-use ID to correlate with a particular
+        # subagent, so only use the transcript when it provides one candidate.
+        descriptions = []
         for line in reversed(lines):
             line = line.strip()
             if not line:
@@ -66,7 +69,9 @@ def read_description_from_transcript(transcript_path):
                     inp = item.get("input", {})
                     desc = inp.get("description", "")
                     if desc:
-                        return desc
+                        descriptions.append(desc)
+        if len(descriptions) == 1:
+            return descriptions[0]
     except (OSError, IOError):
         pass
     return None

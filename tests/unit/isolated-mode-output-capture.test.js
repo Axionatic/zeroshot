@@ -13,19 +13,62 @@
 const assert = require('assert');
 const Orchestrator = require('../../src/orchestrator');
 const IsolationManager = require('../../src/isolation-manager');
+const { spawnClaudeTaskIsolated } = require('../../src/agent/agent-task-executor');
+const { getSubagentEventsDir, getSubagentEventsFile } = require('../../src/subagent-events');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
 // This test requires Docker and full isolation mode support
 // Skip in CI - isolation mode tests require more than just Docker being available
-const hasDocker = IsolationManager.isDockerAvailable();
 const isCI = process.env.CI === 'true' || process.env.CI === '1';
+const hasDocker = !isCI && IsolationManager.isDockerAvailable();
 const hasImage = hasDocker && IsolationManager.imageExists('zeroshot-cluster-base');
 const claudeConfigDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 const hasClaudeCredentials = fs.existsSync(path.join(claudeConfigDir, '.credentials.json'));
 
 const shouldRun = hasDocker && !isCI && hasImage && hasClaudeCredentials;
+
+describe('isolated Claude subagent tracking handoff', () => {
+  const clusterId = `zs-isolated-exec-${process.pid}-${Math.random().toString(36).slice(2)}`;
+  const agentId = 'isolated-claude';
+  const eventsDir = getSubagentEventsDir(clusterId);
+  const eventsFile = getSubagentEventsFile(clusterId, agentId);
+
+  afterEach(() => {
+    fs.rmSync(eventsDir, { recursive: true, force: true });
+  });
+
+  it('creates the event file and passes tracking environment before isolated Claude starts', async () => {
+    let receivedEnv;
+    const manager = {
+      spawnInContainer(receivedClusterId, _command, { env }) {
+        assert.strictEqual(receivedClusterId, clusterId);
+        assert.strictEqual(fs.existsSync(eventsFile), true);
+        receivedEnv = env;
+        throw new Error('stop after inspecting spawn handoff');
+      },
+    };
+    const agent = {
+      id: agentId,
+      role: 'worker',
+      config: { outputFormat: 'text' },
+      isolation: { manager, clusterId },
+      _resolveProvider: () => 'claude',
+      _resolveModelSpec: () => ({ model: null }),
+      _selectModel: () => null,
+      _log: () => {},
+    };
+
+    await assert.rejects(
+      () => spawnClaudeTaskIsolated(agent, 'test context'),
+      /stop after inspecting spawn handoff/
+    );
+
+    assert.strictEqual(receivedEnv.ZEROSHOT_TRACK_SUBAGENTS, '1');
+    assert.strictEqual(receivedEnv.ZEROSHOT_SUBAGENT_EVENTS_FILE, eventsFile);
+  });
+});
 
 (shouldRun ? describe : describe.skip)('Isolated Mode Output Capture', () => {
   let orchestrator;

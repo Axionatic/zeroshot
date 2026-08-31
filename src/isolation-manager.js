@@ -20,6 +20,7 @@ const { normalizeProviderName } = require('../lib/provider-names');
 const { resolveMounts, resolveEnvs, expandEnvPatterns } = require('../lib/docker-config');
 const { getProvider } = require('./providers');
 const { readRepoSettings } = require('../lib/repo-settings');
+const { getSubagentEventsDir } = require('./subagent-events');
 
 const DEFAULT_WORKTREE_SETUP_TIMEOUT_MS = 15 * 60 * 1000;
 
@@ -163,11 +164,17 @@ class IsolationManager {
     const clusterConfigDir = this._createClusterConfigDir(clusterId, containerHome);
     console.log(`[IsolationManager] Created cluster config dir at ${clusterConfigDir}`);
 
+    const subagentEventsDir = providerName === 'claude' ? getSubagentEventsDir(clusterId) : null;
+    if (subagentEventsDir) {
+      fs.mkdirSync(subagentEventsDir, { recursive: true });
+    }
+
     const args = this._buildBaseDockerArgs({
       containerName,
       workDir,
       containerHome,
       clusterConfigDir,
+      subagentEventsDir,
     });
 
     const mountedHosts = this._applyCredentialMounts(args, config, settings, containerHome);
@@ -250,8 +257,14 @@ class IsolationManager {
     return isolatedDir;
   }
 
-  _buildBaseDockerArgs({ containerName, workDir, containerHome, clusterConfigDir }) {
-    return [
+  _buildBaseDockerArgs({
+    containerName,
+    workDir,
+    containerHome,
+    clusterConfigDir,
+    subagentEventsDir = null,
+  }) {
+    const args = [
       'run',
       '-d',
       '--name',
@@ -265,6 +278,10 @@ class IsolationManager {
       '-v',
       `${clusterConfigDir}:${containerHome}/.claude`,
     ];
+    if (subagentEventsDir) {
+      args.push('-v', `${subagentEventsDir}:${subagentEventsDir}`);
+    }
+    return args;
   }
 
   _resolveMountConfig(config, settings) {
@@ -1055,6 +1072,14 @@ class IsolationManager {
     fs.copyFileSync(hookScriptSrc, hookScriptDst);
     fs.chmodSync(hookScriptDst, 0o755);
 
+    const subagentHookScriptSrc = path.join(__dirname, '..', 'cluster-hooks', 'track-subagents.py');
+    const subagentHookScriptDst = path.join(hooksDir, 'track-subagents.py');
+    const hasSubagentHook = fs.existsSync(subagentHookScriptSrc);
+    if (hasSubagentHook) {
+      fs.copyFileSync(subagentHookScriptSrc, subagentHookScriptDst);
+      fs.chmodSync(subagentHookScriptDst, 0o755);
+    }
+
     // Create settings.json with PreToolUse hook to block AskUserQuestion
     // This PREVENTS agents from asking questions in non-interactive mode
     const clusterSettings = {
@@ -1072,6 +1097,18 @@ class IsolationManager {
         ],
       },
     };
+    if (hasSubagentHook) {
+      const subagentHook = {
+        hooks: [
+          {
+            type: 'command',
+            command: `${containerHome}/.claude/hooks/track-subagents.py`,
+          },
+        ],
+      };
+      clusterSettings.hooks.SubagentStart = [subagentHook];
+      clusterSettings.hooks.SubagentStop = [subagentHook];
+    }
     fs.writeFileSync(
       path.join(configDir, 'settings.json'),
       JSON.stringify(clusterSettings, null, 2)
