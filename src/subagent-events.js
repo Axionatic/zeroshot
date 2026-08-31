@@ -14,10 +14,26 @@ function prepareSubagentEventsFile(filePath) {
   try {
     const directory = path.dirname(filePath);
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    fs.chmodSync(directory, 0o700);
+    if ((fs.statSync(directory).mode & 0o777) !== 0o711) {
+      fs.chmodSync(directory, 0o700);
+    }
     const fd = fs.openSync(filePath, 'a', 0o600);
     fs.closeSync(fd);
     fs.chmodSync(filePath, 0o600);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function prepareSharedSubagentEventsFile(filePath) {
+  try {
+    const directory = path.dirname(filePath);
+    fs.mkdirSync(directory, { recursive: true, mode: 0o711 });
+    fs.chmodSync(directory, 0o711);
+    const fd = fs.openSync(filePath, 'a', 0o622);
+    fs.closeSync(fd);
+    fs.chmodSync(filePath, 0o622);
     return true;
   } catch {
     return false;
@@ -38,5 +54,6 @@ module.exports = {
   getSubagentEventsDir,
   getSubagentEventsFile,
   prepareSubagentEventsFile,
+  prepareSharedSubagentEventsFile,
   appendSubagentEvent,
 };

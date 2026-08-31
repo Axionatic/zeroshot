@@ -139,11 +139,19 @@ def main():
             directory = os.path.dirname(events_file)
             if directory:
                 os.makedirs(directory, mode=0o700, exist_ok=True)
-                os.chmod(directory, 0o700)
+                try:
+                    os.chmod(directory, 0o700)
+                except OSError:
+                    # Cross-UID isolated mounts are pre-created by the host.
+                    pass
             old_umask = os.umask(0o077)
             try:
                 with open(events_file, "a") as f:
-                    os.chmod(events_file, 0o600)
+                    try:
+                        os.chmod(events_file, 0o600)
+                    except OSError:
+                        # A host-owned shared file may be writable but not chmod-able.
+                        pass
                     f.write(json.dumps(event) + "\n")
             finally:
                 os.umask(old_umask)

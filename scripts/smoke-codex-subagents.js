@@ -15,6 +15,7 @@ const { createCodexSubagentObserver } = require('../src/codex-subagent-observer'
 
 const ACTIVATION_ENV = 'CODEX_SUBAGENT_SMOKE';
 const DEFAULT_SMOKE_TIMEOUT_MS = 2 * 60 * 1000;
+const DEFAULT_KILL_GRACE_MS = 1000;
 const smokePrompt = [
   'This is a safe collaboration telemetry smoke test.',
   'If Codex collaboration tools are available, use spawn_agent exactly once to ask a subagent to reply "ack", then close it after its response.',
@@ -35,6 +36,7 @@ function runCodexSmoke({
   eventsFile: _eventsFile,
   onLine,
   timeoutMs = DEFAULT_SMOKE_TIMEOUT_MS,
+  killGraceMs = DEFAULT_KILL_GRACE_MS,
   spawnProcess = spawn,
 }) {
   return new Promise((resolve, reject) => {
@@ -45,19 +47,52 @@ function runCodexSmoke({
     let stdoutBuffer = '';
     let stderr = '';
     let settled = false;
-    const timeout = setTimeout(() => {
+    let timedOut = false;
+    let timeout = null;
+    let killTimer = null;
+    let detachTimer = null;
+
+    const clearTimers = () => {
+      clearTimeout(timeout);
+      if (killTimer) clearTimeout(killTimer);
+      if (detachTimer) clearTimeout(detachTimer);
+    };
+
+    const resolveTimeout = ({ detach = false } = {}) => {
       if (settled) return;
       settled = true;
-      try {
-        child.kill('SIGTERM');
-      } catch {
-        // The timeout result remains authoritative if the child already exited.
+      clearTimers();
+      if (detach) {
+        child.stdout?.destroy?.();
+        child.stderr?.destroy?.();
+        child.unref?.();
       }
       resolve({
         code: 124,
         stderr: `Codex smoke command timed out after ${timeoutMs}ms`,
         timedOut: true,
       });
+    };
+
+    timeout = setTimeout(() => {
+      if (settled) return;
+      timedOut = true;
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        resolveTimeout();
+        return;
+      }
+      killTimer = setTimeout(() => {
+        if (settled) return;
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          resolveTimeout();
+          return;
+        }
+        detachTimer = setTimeout(() => resolveTimeout({ detach: true }), killGraceMs);
+      }, killGraceMs);
     }, timeoutMs);
 
     child.stdout.on('data', (data) => {
@@ -70,14 +105,22 @@ function runCodexSmoke({
     });
     child.on('error', (error) => {
       if (settled) return;
+      if (timedOut) {
+        resolveTimeout();
+        return;
+      }
       settled = true;
-      clearTimeout(timeout);
+      clearTimers();
       reject(error);
     });
     child.on('close', (code) => {
       if (settled) return;
+      if (timedOut) {
+        resolveTimeout();
+        return;
+      }
       settled = true;
-      clearTimeout(timeout);
+      clearTimers();
       if (stdoutBuffer) onLine(stdoutBuffer);
       resolve({ code, stderr: stderr.trim() });
     });

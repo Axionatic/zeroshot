@@ -115,8 +115,8 @@ describe('isolated Claude subagent tracking handoff', () => {
       spawnInContainer(receivedClusterId, _command, { env }) {
         assert.strictEqual(receivedClusterId, clusterId);
         assert.strictEqual(fs.existsSync(eventsFile), true);
-        assert.strictEqual(fs.statSync(eventsDir).mode & 0o777, 0o700);
-        assert.strictEqual(fs.statSync(eventsFile).mode & 0o777, 0o600);
+        assert.strictEqual(fs.statSync(eventsDir).mode & 0o777, 0o711);
+        assert.strictEqual(fs.statSync(eventsFile).mode & 0o777, 0o622);
         receivedEnv = env;
         throw new Error('stop after inspecting spawn handoff');
       },
@@ -161,7 +161,7 @@ describe('isolated Claude subagent tracking handoff', () => {
     try {
       await manager.createContainer(clusterId, { workDir: '/workspace-source', provider: 'codex' });
       assert.ok(dockerArgs.includes(`${eventsDir}:${eventsDir}`));
-      assert.strictEqual(fs.statSync(eventsDir).mode & 0o777, 0o700);
+      assert.strictEqual(fs.statSync(eventsDir).mode & 0o777, 0o711);
 
       manager.spawnInContainer = (_receivedClusterId, _command, { env }) => {
         assert.strictEqual(fs.existsSync(eventsFile), true);
@@ -460,7 +460,8 @@ describe('isolated Codex terminal settlement', function () {
     const rootRecord = '{"type":"thread.started","thread_id":"root"}';
     const spawnRecord =
       '{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["unseen-child"],"prompt":"Unseen drain"}}';
-    const finalOutput = `${rootRecord}\n${spawnRecord}\n`;
+    const timestamp = 1700000000000;
+    const finalOutput = `[${timestamp}]${rootRecord}\n[${timestamp + 1}]${spawnRecord}\n`;
     const manager = {
       spawnInContainer: () => tail.process,
       execInContainer(_receivedClusterId, command) {
@@ -481,12 +482,83 @@ describe('isolated Codex terminal settlement', function () {
       observerOptions(probe)
     );
     await new Promise((resolve) => setTimeout(resolve, 5));
-    tail.process.stdout.emit('data', Buffer.from(`${rootRecord}\n`));
+    tail.process.stdout.emit('data', Buffer.from(`[${timestamp}]${rootRecord}\n`));
 
     await assert.rejects(() => taskPromise, /timeout after 30ms/);
 
     assert.deepStrictEqual(probe.sequence, [rootRecord, spawnRecord, 'finish']);
     assert.deepStrictEqual(publishedLines, [rootRecord]);
+  });
+
+  it('uses byte offsets when a live tail chunk splits a UTF-8 character', async () => {
+    const probe = createObserverProbe();
+    const tail = createTailProbe();
+    const rootRecord = '{"type":"thread.started","thread_id":"root"}';
+    const unicodeRecord =
+      '{"type":"item.completed","item":{"type":"agent_message","text":"split 😀"}}';
+    const spawnRecord =
+      '{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["utf8-child"],"prompt":"Unseen after UTF-8"}}';
+    const finalOutput = `${rootRecord}\n${unicodeRecord}\n${spawnRecord}\n`;
+    const manager = {
+      spawnInContainer: () => tail.process,
+      execInContainer(_receivedClusterId, command) {
+        const shell = command[2];
+        if (shell.includes('get-log-path')) {
+          return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
+        }
+        if (shell.includes('zeroshot status')) {
+          return Promise.resolve({ code: 0, stdout: 'Status: running\n', stderr: '' });
+        }
+        return Promise.resolve({ code: 0, stdout: finalOutput, stderr: '' });
+      },
+    };
+    const { agent } = createCodexAgent(manager, { timeout: 30 });
+    const taskPromise = followClaudeTaskLogsIsolated(
+      agent,
+      'task-split-utf8',
+      observerOptions(probe)
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    const observedPrefix = Buffer.from(`${rootRecord}\n${unicodeRecord}\n`);
+    const emojiStart = observedPrefix.indexOf(Buffer.from('😀'));
+    tail.process.stdout.emit('data', observedPrefix.subarray(0, emojiStart + 2));
+    tail.process.stdout.emit('data', observedPrefix.subarray(emojiStart + 2));
+
+    await assert.rejects(() => taskPromise, /timeout after 30ms/);
+    assert.ok(
+      probe.sequence.includes(spawnRecord),
+      'final drain should preserve the unseen record'
+    );
+  });
+
+  it('does not wait for a telemetry-only final read before rejecting a timeout', async () => {
+    const probe = createObserverProbe();
+    const tail = createTailProbe();
+    const manager = {
+      spawnInContainer: () => tail.process,
+      execInContainer(_receivedClusterId, command) {
+        const shell = command[2];
+        if (shell.includes('get-log-path')) {
+          return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
+        }
+        if (shell.includes('zeroshot status')) {
+          return Promise.resolve({ code: 0, stdout: 'Status: running\n', stderr: '' });
+        }
+        return new Promise(() => {});
+      },
+    };
+    const { agent } = createCodexAgent(manager, { timeout: 20 });
+    const outcome = await Promise.race([
+      followClaudeTaskLogsIsolated(agent, 'task-hung-telemetry', observerOptions(probe)).then(
+        () => 'resolved',
+        (error) => error.message
+      ),
+      new Promise((resolve) => setTimeout(() => resolve('still pending'), 100)),
+    ]);
+
+    assert.match(outcome, /timeout after 20ms/);
+    assert.strictEqual(tail.probe.killCount, 1);
   });
 
   it('uses an observer-only final drain on the existing isolated timeout', async () => {

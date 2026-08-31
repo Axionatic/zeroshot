@@ -6,6 +6,7 @@ const path = require('path');
 const {
   getSubagentEventsDir,
   getSubagentEventsFile,
+  prepareSharedSubagentEventsFile,
   appendSubagentEvent,
 } = require('../../src/subagent-events');
 
@@ -44,6 +45,36 @@ describe('subagent event helpers', () => {
 
       assert.strictEqual(fs.statSync(eventsDir).mode & 0o777, 0o700);
       assert.strictEqual(fs.statSync(filePath).mode & 0o777, 0o600);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('prepares a write-only cross-UID event file for an isolated container', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'subagent-events-shared-'));
+    const filePath = path.join(root, 'shared-events', 'parent.jsonl');
+
+    try {
+      assert.strictEqual(prepareSharedSubagentEventsFile(filePath), true);
+      assert.strictEqual(fs.statSync(path.dirname(filePath)).mode & 0o777, 0o711);
+      assert.strictEqual(fs.statSync(filePath).mode & 0o777, 0o622);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves cross-UID directory traversal when a host observer appends nearby', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'subagent-events-mixed-'));
+    const sharedFile = path.join(root, 'mixed-events', 'claude.jsonl');
+    const hostFile = path.join(root, 'mixed-events', 'codex.jsonl');
+
+    try {
+      assert.strictEqual(prepareSharedSubagentEventsFile(sharedFile), true);
+      appendSubagentEvent(hostFile, { event: 'start', agent_id: 'codex-child', ts: 1 });
+
+      assert.strictEqual(fs.statSync(path.dirname(sharedFile)).mode & 0o777, 0o711);
+      assert.strictEqual(fs.statSync(sharedFile).mode & 0o777, 0o622);
+      assert.strictEqual(fs.statSync(hostFile).mode & 0o777, 0o600);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

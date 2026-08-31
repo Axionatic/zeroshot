@@ -11,6 +11,7 @@
  */
 
 const { spawn, spawnSync } = require('child_process');
+const { StringDecoder } = require('string_decoder');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -21,7 +22,7 @@ const { resolveClaudeAuth } = require('../../lib/settings/claude-auth.js');
 const { prependWorktreeToolBinToEnv } = require('../worktree-tooling-env.js');
 const { prepareClaudeConfigDir } = require('../worktree-claude-config.js');
 const { buildRawLogOnlyMetadata } = require('./context-replay-policy');
-const { getSubagentEventsFile, prepareSubagentEventsFile } = require('../subagent-events');
+const { getSubagentEventsFile, prepareSharedSubagentEventsFile } = require('../subagent-events');
 const { createCodexSubagentObserver } = require('../codex-subagent-observer');
 
 function runCommandWithTimeout(command, args, options = {}, callback = null) {
@@ -1760,8 +1761,8 @@ async function spawnClaudeTaskIsolated(agent, context) {
     isolatedEnv.ZEROSHOT_TRACK_SUBAGENTS = '1';
     isolatedEnv.ZEROSHOT_SUBAGENT_EVENTS_FILE = eventsFile;
     try {
-      if (!prepareSubagentEventsFile(eventsFile)) {
-        throw new Error('private event file preparation failed');
+      if (!prepareSharedSubagentEventsFile(eventsFile)) {
+        throw new Error('shared event file preparation failed');
       }
     } catch (error) {
       agent._log(`⚠️ Agent ${agent.id}: Could not prepare subagent tracking: ${error.message}`);
@@ -1885,6 +1886,9 @@ function createIsolatedLogState() {
     timeoutHandle: null,
     lineBuffer: '',
     logFilePath: null,
+    tailBytesSeen: 0,
+    observedLineBytes: 0,
+    tailDecoder: new StringDecoder('utf8'),
   };
 }
 
@@ -1909,10 +1913,20 @@ function buildIsolatedCleanup(state) {
   };
 }
 
+function parseIsolatedTimestampedLine(line) {
+  const normalizedLine = line.replace(/\r$/, '');
+  if (/^\[\d{13}\]/.test(normalizedLine)) {
+    return parseTimestampedLine(normalizedLine);
+  }
+  const timestampMatch = normalizedLine.match(/^\[(\d{4}-\d{2}-\d{2}T[^\]]+)\]\s*(.*)$/);
+  return {
+    timestamp: timestampMatch ? new Date(timestampMatch[1]).getTime() : Date.now(),
+    content: timestampMatch ? timestampMatch[2] : normalizedLine,
+  };
+}
+
 function broadcastIsolatedLine({ agent, providerName, taskId, line, observer = null }) {
-  const timestampMatch = line.match(/^\[(\d{4}-\d{2}-\d{2}T[^\]]+)\]\s*(.*)$/);
-  const timestamp = timestampMatch ? new Date(timestampMatch[1]).getTime() : Date.now();
-  const content = timestampMatch ? timestampMatch[2] : line;
+  const { timestamp, content } = parseIsolatedTimestampedLine(line);
   observeCodexLine(observer, content);
 
   agent.messageBus.publish({
@@ -1955,7 +1969,14 @@ function startIsolatedTail({ agent, manager, clusterId, logFilePath, state, onLi
   ]);
 
   state.tailProcess.stdout.on('data', (data) => {
-    const chunk = data.toString();
+    const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    const previousBytes = state.tailBytesSeen;
+    const lastNewline = buffer.lastIndexOf(0x0a);
+    if (lastNewline >= 0) {
+      state.observedLineBytes = previousBytes + lastNewline + 1;
+    }
+    state.tailBytesSeen += buffer.length;
+    const chunk = state.tailDecoder.write(buffer);
     state.fullOutput += chunk;
     appendIsolatedContent(state, chunk, onLine);
   });
@@ -2006,15 +2027,16 @@ async function drainIsolatedObserver({ manager, clusterId, state, observer }) {
       `cat "${state.logFilePath}" 2>/dev/null || echo ""`,
     ]);
     if (finalReadResult.code === 0 && finalReadResult.stdout) {
-      const observedLength = Math.max(0, state.fullOutput.length - state.lineBuffer.length);
-      unseenContent = finalReadResult.stdout.slice(observedLength);
+      const finalBuffer = Buffer.from(finalReadResult.stdout, 'utf8');
+      unseenContent = finalBuffer
+        .subarray(Math.min(state.observedLineBytes, finalBuffer.length))
+        .toString('utf8');
     }
   }
 
   for (const line of unseenContent.split('\n')) {
     if (!line.trim()) continue;
-    const timestampMatch = line.match(/^\[(\d{4}-\d{2}-\d{2}T[^\]]+)\]\s*(.*)$/);
-    observeCodexLine(observer, timestampMatch ? timestampMatch[2] : line);
+    observeCodexLine(observer, parseIsolatedTimestampedLine(line).content);
   }
 }
 
@@ -2059,7 +2081,7 @@ function createIsolatedFinalizer({
           // Preserve the existing result path when the final output read fails.
         }
       }
-      await observerFinalizer({ drain: !drainOutput });
+      void observerFinalizer({ drain: !drainOutput });
       try {
         cleanup();
       } catch {

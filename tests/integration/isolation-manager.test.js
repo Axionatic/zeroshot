@@ -14,7 +14,11 @@
 const assert = require('assert');
 const { EventEmitter } = require('events');
 const fs = require('fs');
-const { getSubagentEventsDir, getSubagentEventsFile } = require('../../src/subagent-events');
+const {
+  getSubagentEventsDir,
+  getSubagentEventsFile,
+  prepareSharedSubagentEventsFile,
+} = require('../../src/subagent-events');
 const { SubagentTracker } = require('../../src/subagent-tracker');
 const { runCodexSmoke, runSmoke } = require('../../scripts/smoke-codex-subagents');
 const IsolationManager = require('../../src/isolation-manager');
@@ -198,11 +202,12 @@ describe('IsolationManager', function () {
         workDir: process.cwd(),
         image: 'alpine:latest',
       });
+      assert.strictEqual(prepareSharedSubagentEventsFile(eventsFile), true);
 
       const result = await manager.execInContainer(testClusterId, [
         'sh',
         '-c',
-        `printf '%s\\n' '${JSON.stringify(event)}' > '${eventsFile}'`,
+        `adduser -D -u 1000 telemetry && su telemetry -s /bin/sh -c "printf '%s\\n' '${JSON.stringify(event)}' >> '${eventsFile}'"`,
       ]);
       assert.strictEqual(result.code, 0, result.stderr);
 
@@ -257,24 +262,30 @@ describe('Codex subagent smoke script', function () {
     assert.match(output.join('\n'), /provider invocation was not run/i);
   });
 
-  it('terminates an activated provider child at the injected timeout', async function () {
+  it('escalates and detaches an activated provider child that ignores the timeout signal', async function () {
     const child = new EventEmitter();
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
     const signals = [];
+    let unrefCount = 0;
     child.kill = (signal) => {
       signals.push(signal);
       return true;
+    };
+    child.unref = () => {
+      unrefCount++;
     };
 
     const result = await runCodexSmoke({
       eventsFile: '/tmp/not-used-by-provider-runner.jsonl',
       onLine: () => {},
       timeoutMs: 5,
+      killGraceMs: 5,
       spawnProcess: () => child,
     });
 
-    assert.deepStrictEqual(signals, ['SIGTERM']);
+    assert.deepStrictEqual(signals, ['SIGTERM', 'SIGKILL']);
+    assert.strictEqual(unrefCount, 1);
     assert.strictEqual(result.code, 124);
     assert.strictEqual(result.timedOut, true);
     assert.match(result.stderr, /timed out after 5ms/i);

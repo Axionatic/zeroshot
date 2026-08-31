@@ -121,13 +121,13 @@ function createCodexSubagentObserver({ eventsFile, now = Date.now }) {
       const item = record.item;
       if (!item || typeof item !== 'object' || item.type !== 'collab_tool_call') return;
 
-      observeAgentStates(record, item);
-
       if (item.tool === 'spawn_agent') {
         observeSpawn(item);
+        observeAgentStates(record, item);
         return;
       }
 
+      observeAgentStates(record, item);
       if (item.tool === 'close_agent') observeClose(item);
     } catch {
       // Malformed or unavailable telemetry is ignored.

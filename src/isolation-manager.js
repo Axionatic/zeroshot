@@ -167,8 +167,8 @@ class IsolationManager {
     const subagentEventsPath = getSubagentEventsDir(clusterId);
     let subagentEventsDir = null;
     try {
-      fs.mkdirSync(subagentEventsPath, { recursive: true, mode: 0o700 });
-      fs.chmodSync(subagentEventsPath, 0o700);
+      fs.mkdirSync(subagentEventsPath, { recursive: true, mode: 0o711 });
+      fs.chmodSync(subagentEventsPath, 0o711);
       subagentEventsDir = subagentEventsPath;
     } catch (error) {
       console.warn(

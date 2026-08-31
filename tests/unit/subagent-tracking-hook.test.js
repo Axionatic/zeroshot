@@ -405,6 +405,49 @@ print(module.read_description_from_transcript("guarded-transcript") or "")
     expect(fs.statSync(eventsFile).mode & 0o777).to.equal(0o600);
   });
 
+  it('still appends when a shared isolated file cannot be chmodded by the container UID', function () {
+    if (!python) return this.skip();
+
+    fs.mkdirSync(eventsDir, { recursive: true, mode: 0o711 });
+    fs.chmodSync(eventsDir, 0o711);
+    fs.writeFileSync(eventsFile, '', { mode: 0o622 });
+    fs.chmodSync(eventsFile, 0o622);
+    const probe = String.raw`
+import importlib.util
+import io
+import json
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("track_subagents", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.os.chmod = lambda *_args: (_ for _ in ()).throw(PermissionError("not owner"))
+sys.stdin = io.StringIO(json.dumps({
+    "hook_event_name": "SubagentStart",
+    "agent_id": "shared-child",
+    "agent_type": "Explore",
+}))
+try:
+    module.main()
+except SystemExit as exc:
+    if exc.code not in (None, 0):
+        raise
+`;
+    const result = spawnSync(python, ['-c', probe, HOOK_SCRIPT], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PYTHONDONTWRITEBYTECODE: '1',
+        ZEROSHOT_TRACK_SUBAGENTS: '1',
+        ZEROSHOT_SUBAGENT_EVENTS_FILE: eventsFile,
+      },
+    });
+
+    expect(result.status, result.stderr).to.equal(0);
+    expect(JSON.parse(fs.readFileSync(eventsFile, 'utf8')).agent_id).to.equal('shared-child');
+  });
+
   it('writes nothing unless ZEROSHOT_TRACK_SUBAGENTS is set', function () {
     if (!python) return this.skip();
 

@@ -118,6 +118,19 @@ describe('Codex subagent observer', () => {
     );
   });
 
+  it('applies terminal state included in the same completed spawn record', () => {
+    const observer = createObserver();
+    observer.observeLine('{"type":"thread.started","thread_id":"root"}');
+    observer.observeLine(
+      '{"type":"item.completed","agents_states":{"fast-child":{"status":"completed"}},"item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["fast-child"],"prompt":"Fast work"}}'
+    );
+
+    assert.deepStrictEqual(readEvents(eventsFile), [
+      { event: 'start', agent_id: 'fast-child', description: 'Fast work', ts: 1000 },
+      { event: 'stop', agent_id: 'fast-child', ts: 1001 },
+    ]);
+  });
+
   it('requires successful close_agent and stops only known receiver IDs', () => {
     const observer = createObserver();
     observer.observeLine('{"type":"thread.started","thread_id":"root"}');
