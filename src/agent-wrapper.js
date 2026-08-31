@@ -349,8 +349,8 @@ class AgentWrapper {
   /**
    * Stop the agent
    */
-  stop() {
-    return lifecycleStop(this);
+  stop(options) {
+    return lifecycleStop(this, options);
   }
 
   /**

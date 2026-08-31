@@ -704,6 +704,27 @@ describe('isolated Codex terminal settlement', function () {
     assert.deepStrictEqual(killCommands, [['zeroshot', 'kill', 'task-kill-cleanup']]);
     assert.strictEqual(result.success, false);
   });
+
+  it('retains the isolated task ID and reports a failed container kill', async () => {
+    const messages = [];
+    const agent = {
+      currentTask: null,
+      currentTaskId: 'task-still-running',
+      isolation: {
+        clusterId: codexLifecycleClusterId,
+        manager: {
+          execInContainer: () =>
+            Promise.resolve({ code: 1, stdout: '', stderr: 'permission denied' }),
+        },
+      },
+      _log: (message) => messages.push(message),
+    };
+
+    await assert.rejects(() => killTask(agent), /permission denied/);
+
+    assert.strictEqual(agent.currentTaskId, 'task-still-running');
+    assert.match(messages.join('\n'), /Could not kill isolated task/);
+  });
 });
 
 (shouldRun ? describe : describe.skip)('Isolated Mode Output Capture', () => {

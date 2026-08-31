@@ -3403,7 +3403,7 @@ Continue from where you left off. Review your previous output to understand what
         // This prevents the old instance from draining buffered messages or
         // finishing in-flight work after the new agent has already started.
         if (existingAgent.stop) {
-          await existingAgent.stop();
+          await existingAgent.stop({ requireTaskTermination: true });
         }
 
         // Remove from cluster.agents array
@@ -3475,7 +3475,7 @@ Continue from where you left off. Review your previous output to understand what
       }
 
       const agent = cluster.agents[agentIndex];
-      await agent.stop();
+      await agent.stop({ requireTaskTermination: true });
 
       // Remove from cluster.agents
       cluster.agents.splice(agentIndex, 1);

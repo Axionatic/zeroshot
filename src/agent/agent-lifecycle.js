@@ -200,10 +200,14 @@ function start(agent) {
  * Stop the agent
  * Waits for any in-flight execution to complete before returning.
  * @param {AgentWrapper} agent - Agent instance
+ * @param {Object} [options] - Shutdown behavior
+ * @param {boolean} [options.requireTaskTermination=false] - Reject unless task kill completes
+ * @param {number} [options.shutdownTimeoutMs=5000] - Total wait budget for kill and execution
  * @returns {Promise<void>}
  */
-async function stop(agent) {
-  if (!agent.running) {
+async function stop(agent, { requireTaskTermination = false, shutdownTimeoutMs = 5000 } = {}) {
+  const hasTrackedTask = !!(agent.currentTask || agent.currentTaskId);
+  if (!agent.running && !(requireTaskTermination && hasTrackedTask)) {
     return;
   }
 
@@ -215,26 +219,54 @@ async function stop(agent) {
     agent.unsubscribe = null;
   }
 
-  // Kill current task if any
-  if (agent.currentTask || agent.currentTaskId) {
-    await agent._killTask();
+  const pendingShutdown = [];
+  let killError = null;
+  let killFinished = !hasTrackedTask;
+
+  // Kill current task if any, within the same bound as in-flight execution.
+  if (hasTrackedTask) {
+    pendingShutdown.push(
+      Promise.resolve()
+        .then(() => agent._killTask())
+        .catch((error) => {
+          killError = error;
+        })
+        .finally(() => {
+          killFinished = true;
+        })
+    );
   }
 
-  // Wait for in-flight execution to complete (up to 5 seconds)
-  // This prevents write-after-close race conditions
+  // Wait for kill and in-flight execution together. This prevents
+  // write-after-close races without extending the established stop bound.
   if (agent._currentExecution) {
-    try {
-      await Promise.race([
-        agent._currentExecution,
-        new Promise((resolve) => setTimeout(resolve, 5000)),
-      ]);
-    } catch {
-      // Ignore errors from cancelled execution
-    }
+    pendingShutdown.push(Promise.resolve(agent._currentExecution));
+  }
+
+  let shutdownTimedOut = false;
+  if (pendingShutdown.length > 0) {
+    let timeoutHandle;
+    await Promise.race([
+      Promise.allSettled(pendingShutdown),
+      new Promise((resolve) => {
+        timeoutHandle = setTimeout(() => {
+          shutdownTimedOut = true;
+          resolve();
+        }, shutdownTimeoutMs);
+      }),
+    ]);
+    clearTimeout(timeoutHandle);
     agent._currentExecution = null;
   }
 
   agent._log(`Agent ${agent.id} stopped`);
+
+  if (requireTaskTermination) {
+    if (killError) throw killError;
+    if (!killFinished || shutdownTimedOut) {
+      throw new Error(`Timed out terminating task for agent ${agent.id}`);
+    }
+  }
 }
 
 /**

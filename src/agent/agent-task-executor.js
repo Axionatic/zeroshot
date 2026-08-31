@@ -1887,6 +1887,7 @@ function createIsolatedLogState() {
     lineBuffer: '',
     logFilePath: null,
     tailDecoder: new StringDecoder('utf8'),
+    taskHandle: null,
   };
 }
 
@@ -2055,7 +2056,9 @@ function createIsolatedFinalizer({
       if (agent._subagentTrackingCleanup === trackingCleanup) {
         agent._subagentTrackingCleanup = null;
       }
-      agent.currentTask = null;
+      if (agent.currentTask === state.taskHandle) {
+        agent.currentTask = null;
+      }
     })().catch(() => {
       // Finalization is deliberately non-throwing.
     });
@@ -2239,9 +2242,10 @@ function followClaudeTaskLogsIsolated(agent, taskId, options = {}) {
       resolve,
       reject,
     });
-    agent.currentTask = {
+    state.taskHandle = {
       kill: (reason) => settler.cancel(reason),
     };
+    agent.currentTask = state.taskHandle;
 
     Promise.resolve()
       .then(() => {
@@ -2428,6 +2432,28 @@ async function parseResultOutput(agent, output) {
   return parsed;
 }
 
+function settleTaskKillWithin(operation, taskId, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeoutHandle = null;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutHandle);
+      callback(value);
+    };
+    timeoutHandle = setTimeout(
+      () => finish(reject, new Error(`Timed out terminating task ${taskId}`)),
+      timeoutMs
+    );
+
+    Promise.resolve(operation).then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error)
+    );
+  });
+}
+
 /**
  * Kill current task
  * @param {Object} agent - Agent instance
@@ -2462,10 +2488,13 @@ async function killTask(agent) {
 
   if (agent.isolation?.manager) {
     try {
-      const result = await agent.isolation.manager.execInContainer(
-        agent.isolation.clusterId,
-        ['zeroshot', 'kill', taskId],
-        { timeout: 10000 }
+      const result = await settleTaskKillWithin(
+        agent.isolation.manager.execInContainer(
+          agent.isolation.clusterId,
+          ['zeroshot', 'kill', taskId],
+          { timeout: 8000 }
+        ),
+        taskId
       );
       if (result.code !== 0) {
         throw new Error(result.stderr || result.stdout || `exit code ${result.code}`);
@@ -2474,23 +2503,29 @@ async function killTask(agent) {
       agent._log(`Killed isolated task ${taskId}`);
     } catch (error) {
       agent._log(`Note: Could not kill isolated task ${taskId}: ${error.message}`);
+      throw error;
     }
     return;
   }
 
   const ctPath = getClaudeTasksPath();
-  await new Promise((resolve) => {
-    runCommandWithTimeout(ctPath, ['kill', taskId], { timeout: 10000 }, (error) => {
-      if (error) {
-        // Task may have already completed or been killed, retain the ID for diagnostics.
-        agent._log(`Note: Could not kill task ${taskId}: ${error.message}`);
-      } else {
-        if (agent.currentTaskId === taskId) agent.currentTaskId = null;
-        agent._log(`Killed task ${taskId}`);
-      }
-      resolve();
-    });
-  });
+  try {
+    await settleTaskKillWithin(
+      new Promise((resolve, reject) => {
+        runCommandWithTimeout(ctPath, ['kill', taskId], { timeout: 8000 }, (error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      }),
+      taskId
+    );
+    if (agent.currentTaskId === taskId) agent.currentTaskId = null;
+    agent._log(`Killed task ${taskId}`);
+  } catch (error) {
+    // Retain the ID so callers can diagnose or retry the failed termination.
+    agent._log(`Note: Could not kill task ${taskId}: ${error.message}`);
+    throw error;
+  }
 }
 
 module.exports = {
