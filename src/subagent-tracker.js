@@ -91,6 +91,21 @@ class SubagentTracker {
    * @private
    */
   _processEvent(agentId, event) {
+    if (
+      !event ||
+      typeof event !== 'object' ||
+      Array.isArray(event) ||
+      (event.event !== 'start' && event.event !== 'stop') ||
+      typeof event.agent_id !== 'string' ||
+      !event.agent_id.trim() ||
+      typeof event.ts !== 'number' ||
+      !Number.isFinite(event.ts) ||
+      (event.description !== undefined && typeof event.description !== 'string') ||
+      (event.agent_type !== undefined && typeof event.agent_type !== 'string')
+    ) {
+      return;
+    }
+
     if (!this.active.has(agentId)) {
       this.active.set(agentId, []);
     }

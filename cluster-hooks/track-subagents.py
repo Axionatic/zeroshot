@@ -138,9 +138,15 @@ def main():
         try:
             directory = os.path.dirname(events_file)
             if directory:
-                os.makedirs(directory, exist_ok=True)
-            with open(events_file, "a") as f:
-                f.write(json.dumps(event) + "\n")
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+                os.chmod(directory, 0o700)
+            old_umask = os.umask(0o077)
+            try:
+                with open(events_file, "a") as f:
+                    os.chmod(events_file, 0o600)
+                    f.write(json.dumps(event) + "\n")
+            finally:
+                os.umask(old_umask)
         except (OSError, IOError):
             pass
 

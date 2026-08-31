@@ -391,6 +391,20 @@ print(module.read_description_from_transcript("guarded-transcript") or "")
     expect(tracker.getActiveSubagents(parentAgentId).map((s) => s.id)).to.deep.equal(['sub-b']);
   });
 
+  it('creates private event storage for normal Claude hooks', function () {
+    if (!python) return this.skip();
+
+    const result = runTrackingHook(python, eventsFile, {
+      hook_event_name: 'SubagentStart',
+      agent_id: 'sub-private',
+      agent_type: 'Explore',
+    });
+
+    expect(result.status, result.stderr).to.equal(0);
+    expect(fs.statSync(eventsDir).mode & 0o777).to.equal(0o700);
+    expect(fs.statSync(eventsFile).mode & 0o777).to.equal(0o600);
+  });
+
   it('writes nothing unless ZEROSHOT_TRACK_SUBAGENTS is set', function () {
     if (!python) return this.skip();
 

@@ -21,7 +21,7 @@ const { resolveClaudeAuth } = require('../../lib/settings/claude-auth.js');
 const { prependWorktreeToolBinToEnv } = require('../worktree-tooling-env.js');
 const { prepareClaudeConfigDir } = require('../worktree-claude-config.js');
 const { buildRawLogOnlyMetadata } = require('./context-replay-policy');
-const { getSubagentEventsFile } = require('../subagent-events');
+const { getSubagentEventsFile, prepareSubagentEventsFile } = require('../subagent-events');
 const { createCodexSubagentObserver } = require('../codex-subagent-observer');
 
 function runCommandWithTimeout(command, args, options = {}, callback = null) {
@@ -1224,11 +1224,31 @@ function appendContentToBuffer(state, content, onLine) {
   state.lineBuffer = lines[lines.length - 1];
 }
 
-function flushLineBuffer(state, onLine) {
-  const line = state.lineBuffer;
-  state.lineBuffer = '';
-  if (line && line.trim()) {
-    onLine(line);
+function drainNormalObserver({ fsModule, state, observer }) {
+  if (!observer) return;
+
+  let unseenContent = state.lineBuffer || '';
+  try {
+    if (state.logFilePath && fsModule.existsSync(state.logFilePath)) {
+      const currentSize = fsModule.statSync(state.logFilePath).size;
+      if (currentSize > state.lastSize) {
+        const fd = fsModule.openSync(state.logFilePath, 'r');
+        try {
+          const buffer = Buffer.alloc(currentSize - state.lastSize);
+          fsModule.readSync(fd, buffer, 0, buffer.length, state.lastSize);
+          unseenContent += buffer.toString('utf8');
+        } finally {
+          fsModule.closeSync(fd);
+        }
+      }
+    }
+  } catch {
+    // The already-buffered trailing record can still be observed below.
+  }
+
+  for (const line of unseenContent.split('\n')) {
+    if (!line.trim()) continue;
+    observeCodexLine(observer, parseTimestampedLine(line).content);
   }
 }
 
@@ -1358,24 +1378,13 @@ async function buildCompletionResult({ agent, taskId, providerName, state, stdou
   };
 }
 
-function finalizeLogFollow(
-  agent,
-  state,
-  { pollLogFile, onLine, observer, drainFinalLine = false } = {}
-) {
+function finalizeLogFollow(agent, state, { drainObserver, observer } = {}) {
   if (state.finalized) return;
   state.finalized = true;
-  if (drainFinalLine) {
-    try {
-      pollLogFile?.();
-    } catch {
-      // The final drain is best effort; task settlement must continue.
-    }
-    try {
-      if (onLine) flushLineBuffer(state, onLine);
-    } catch {
-      // Output rendering errors must not strand observer cleanup.
-    }
+  try {
+    drainObserver?.();
+  } catch {
+    // Telemetry finalization must not affect provider settlement.
   }
   finishCodexObserver(observer);
   if (state.pollInterval) {
@@ -1617,10 +1626,8 @@ function createLogFollower({
       });
     const finalize = () =>
       finalizeLogFollow(agent, state, {
-        pollLogFile,
-        onLine: broadcastLine,
         observer,
-        drainFinalLine: isCodex,
+        drainObserver: isCodex ? () => drainNormalObserver({ fsModule, state, observer }) : null,
       });
 
     state.pollInterval = setInterval(pollLogFile, 300);
@@ -1753,8 +1760,9 @@ async function spawnClaudeTaskIsolated(agent, context) {
     isolatedEnv.ZEROSHOT_TRACK_SUBAGENTS = '1';
     isolatedEnv.ZEROSHOT_SUBAGENT_EVENTS_FILE = eventsFile;
     try {
-      fs.mkdirSync(path.dirname(eventsFile), { recursive: true });
-      fs.closeSync(fs.openSync(eventsFile, 'a'));
+      if (!prepareSubagentEventsFile(eventsFile)) {
+        throw new Error('private event file preparation failed');
+      }
     } catch (error) {
       agent._log(`⚠️ Agent ${agent.id}: Could not prepare subagent tracking: ${error.message}`);
     }
@@ -1877,7 +1885,6 @@ function createIsolatedLogState() {
     timeoutHandle: null,
     lineBuffer: '',
     logFilePath: null,
-    consecutiveStatusFailures: 0,
   };
 }
 
@@ -1972,49 +1979,95 @@ function startIsolatedTail({ agent, manager, clusterId, logFilePath, state, onLi
 }
 
 async function drainIsolatedLog({ manager, clusterId, state, onLine }) {
+  if (!state.logFilePath) return;
+  const finalReadResult = await manager.execInContainer(clusterId, [
+    'sh',
+    '-c',
+    `cat "${state.logFilePath}" 2>/dev/null || echo ""`,
+  ]);
+
+  if (finalReadResult.code === 0 && finalReadResult.stdout) {
+    state.fullOutput = finalReadResult.stdout;
+    for (const line of state.fullOutput.split('\n')) {
+      if (line.trim()) onLine(line);
+    }
+    state.lineBuffer = '';
+  }
+}
+
+async function drainIsolatedObserver({ manager, clusterId, state, observer }) {
+  if (!observer) return;
+
+  let unseenContent = state.lineBuffer || '';
   if (state.logFilePath) {
     const finalReadResult = await manager.execInContainer(clusterId, [
       'sh',
       '-c',
       `cat "${state.logFilePath}" 2>/dev/null || echo ""`,
     ]);
-
     if (finalReadResult.code === 0 && finalReadResult.stdout) {
-      state.fullOutput = finalReadResult.stdout;
-      for (const line of state.fullOutput.split('\n')) {
-        if (line.trim()) onLine(line);
-      }
-      state.lineBuffer = '';
-      return;
+      const observedLength = Math.max(0, state.fullOutput.length - state.lineBuffer.length);
+      unseenContent = finalReadResult.stdout.slice(observedLength);
     }
   }
 
-  flushLineBuffer(state, onLine);
+  for (const line of unseenContent.split('\n')) {
+    if (!line.trim()) continue;
+    const timestampMatch = line.match(/^\[(\d{4}-\d{2}-\d{2}T[^\]]+)\]\s*(.*)$/);
+    observeCodexLine(observer, timestampMatch ? timestampMatch[2] : line);
+  }
 }
 
-function createIsolatedFinalizer({ agent, manager, clusterId, state, cleanup, observer, onLine }) {
+function createIsolatedObserverFinalizer({ manager, clusterId, state, observer }) {
+  let finalizationPromise = null;
   return ({ drain = true } = {}) => {
-    if (state.finalizationPromise) return state.finalizationPromise;
-    state.taskExited = true;
-    state.finalizationPromise = (async () => {
+    if (finalizationPromise) return finalizationPromise;
+    finalizationPromise = (async () => {
       if (drain) {
         try {
-          await drainIsolatedLog({ manager, clusterId, state, onLine });
+          await drainIsolatedObserver({ manager, clusterId, state, observer });
         } catch {
-          try {
-            flushLineBuffer(state, onLine);
-          } catch {
-            // A failed final read/render must not strand observer cleanup.
-          }
+          // A final telemetry read is best effort.
         }
       }
       finishCodexObserver(observer);
+    })().catch(() => {
+      finishCodexObserver(observer);
+    });
+    return finalizationPromise;
+  };
+}
+
+function createIsolatedFinalizer({
+  agent,
+  manager,
+  clusterId,
+  state,
+  cleanup,
+  observerFinalizer,
+  onLine,
+  trackingCleanup,
+}) {
+  return ({ drainOutput = false } = {}) => {
+    if (state.finalizationPromise) return state.finalizationPromise;
+    state.taskExited = true;
+    state.finalizationPromise = (async () => {
+      if (drainOutput) {
+        try {
+          await drainIsolatedLog({ manager, clusterId, state, onLine });
+        } catch {
+          // Preserve the existing result path when the final output read fails.
+        }
+      }
+      await observerFinalizer({ drain: !drainOutput });
       try {
         cleanup();
       } catch {
         // Cleanup is best effort on every settle path.
       }
-      agent.currentTask = null;
+      if (agent._subagentTrackingCleanup === trackingCleanup) {
+        agent._subagentTrackingCleanup = null;
+      }
     })().catch(() => {
       // Finalization is deliberately non-throwing.
     });
@@ -2022,35 +2075,18 @@ function createIsolatedFinalizer({ agent, manager, clusterId, state, cleanup, ob
   };
 }
 
-function createIsolatedSettler({
-  state,
-  finalize,
-  resolve,
-  reject,
-  drainOnReject,
-  rejectOnStatusExhaustion,
-  rejectBuildErrors,
-}) {
+function createIsolatedSettler({ state, finalize, resolve, reject }) {
   return {
-    rejectOnStatusExhaustion,
     resolve: async (buildResult) => {
       if (state.settled) return;
       state.settled = true;
-      await finalize({ drain: true });
-      try {
-        resolve(await buildResult());
-      } catch (error) {
-        if (rejectBuildErrors) {
-          reject(error);
-          return;
-        }
-        throw error;
-      }
+      await finalize({ drainOutput: true });
+      resolve(await buildResult());
     },
     reject: async (error) => {
       if (state.settled) return;
       state.settled = true;
-      await finalize({ drain: drainOnReject });
+      await finalize({ drainOutput: false });
       reject(error);
     },
   };
@@ -2080,7 +2116,6 @@ async function checkIsolatedStatus({
   const isNotFound = statusOutput.includes('not_found');
 
   if (!isSuccess && !isError && !isNotFound) {
-    state.consecutiveStatusFailures = 0;
     return;
   }
 
@@ -2127,7 +2162,6 @@ function startIsolatedStatusChecks({
   state,
   settler,
   statusIntervalMs,
-  maxStatusFailures,
 }) {
   state.statusCheckInterval = setInterval(() => {
     checkIsolatedStatus({
@@ -2140,20 +2174,12 @@ function startIsolatedStatusChecks({
       state,
       settler,
     }).catch((statusErr) => {
-      if (state.taskExited) return;
-      state.consecutiveStatusFailures++;
       agent._log(`[${agent.id}] Status check error (will retry): ${statusErr.message}`);
-      if (
-        settler.rejectOnStatusExhaustion &&
-        state.consecutiveStatusFailures >= maxStatusFailures
-      ) {
-        settler.reject(statusErr).catch(() => {});
-      }
     });
   }, statusIntervalMs);
 }
 
-function installIsolatedTerminalControls({ agent, taskId, state, enableKill, settler }) {
+function installIsolatedTimeout({ agent, taskId, state, settler }) {
   if (agent.timeout > 0) {
     state.timeoutHandle = setTimeout(() => {
       if (state.taskExited) return;
@@ -2161,14 +2187,6 @@ function installIsolatedTerminalControls({ agent, taskId, state, enableKill, set
         .reject(new Error(`Task ${taskId} timeout after ${agent.timeout}ms (isolated mode)`))
         .catch(() => {});
     }, agent.timeout);
-  }
-
-  if (enableKill) {
-    agent.currentTask = {
-      kill: (reason = 'Task killed') => {
-        settler.reject(new Error(reason)).catch(() => {});
-      },
-    };
   }
 }
 
@@ -2181,10 +2199,8 @@ function followClaudeTaskLogsIsolated(agent, taskId, options = {}) {
   const manager = isolation.manager;
   const clusterId = isolation.clusterId;
   const providerName = agent._resolveProvider ? agent._resolveProvider() : 'claude';
-  const isCodex = providerName === 'codex';
   const observerFactory = options.observerFactory || createCodexSubagentObserver;
   const statusIntervalMs = options.statusIntervalMs || 2000;
-  const maxStatusFailures = options.maxStatusFailures || MAX_STATUS_FAILURES;
 
   return new Promise((resolve, reject) => {
     const state = createIsolatedLogState();
@@ -2196,33 +2212,34 @@ function followClaudeTaskLogsIsolated(agent, taskId, options = {}) {
       observerFactory
     );
     const onLine = (line) => broadcastIsolatedLine({ agent, providerName, taskId, line, observer });
+    const observerFinalizer = createIsolatedObserverFinalizer({
+      manager,
+      clusterId,
+      state,
+      observer,
+    });
+    const trackingCleanup = () => {
+      observerFinalizer({ drain: true }).catch(() => {});
+    };
+    if (observer) {
+      agent._subagentTrackingCleanup = trackingCleanup;
+    }
     const finalize = createIsolatedFinalizer({
       agent,
       manager,
       clusterId,
       state,
       cleanup,
-      observer,
+      observerFinalizer,
       onLine,
+      trackingCleanup,
     });
     const settler = createIsolatedSettler({
       state,
       finalize,
       resolve,
       reject,
-      drainOnReject: isCodex,
-      rejectOnStatusExhaustion: isCodex,
-      rejectBuildErrors: isCodex,
     });
-    if (isCodex) {
-      installIsolatedTerminalControls({
-        agent,
-        taskId,
-        state,
-        enableKill: true,
-        settler,
-      });
-    }
 
     Promise.resolve()
       .then(() => {
@@ -2271,18 +2288,9 @@ function followClaudeTaskLogsIsolated(agent, taskId, options = {}) {
           state,
           settler,
           statusIntervalMs,
-          maxStatusFailures,
         });
 
-        if (!isCodex) {
-          installIsolatedTerminalControls({
-            agent,
-            taskId,
-            state,
-            enableKill: false,
-            settler,
-          });
-        }
+        installIsolatedTimeout({ agent, taskId, state, settler });
       })
       .catch((err) => {
         settler.reject(err).catch(() => {});
@@ -2449,6 +2457,14 @@ function killTask(agent) {
       }
     );
     agent.currentTaskId = null;
+  }
+
+  const cleanupSubagentTracking = agent._subagentTrackingCleanup;
+  agent._subagentTrackingCleanup = null;
+  try {
+    cleanupSubagentTracking?.();
+  } catch {
+    // Optional tracking cleanup must never change kill behavior.
   }
 }
 

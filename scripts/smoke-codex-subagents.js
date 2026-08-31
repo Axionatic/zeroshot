@@ -14,6 +14,7 @@ const { getSubagentEventsFile } = require('../src/subagent-events');
 const { createCodexSubagentObserver } = require('../src/codex-subagent-observer');
 
 const ACTIVATION_ENV = 'CODEX_SUBAGENT_SMOKE';
+const DEFAULT_SMOKE_TIMEOUT_MS = 2 * 60 * 1000;
 const smokePrompt = [
   'This is a safe collaboration telemetry smoke test.',
   'If Codex collaboration tools are available, use spawn_agent exactly once to ask a subagent to reply "ack", then close it after its response.',
@@ -30,14 +31,34 @@ function installedCodexVersion() {
   return result.stdout.trim();
 }
 
-function runCodexSmoke({ eventsFile: _eventsFile, onLine }) {
+function runCodexSmoke({
+  eventsFile: _eventsFile,
+  onLine,
+  timeoutMs = DEFAULT_SMOKE_TIMEOUT_MS,
+  spawnProcess = spawn,
+}) {
   return new Promise((resolve, reject) => {
-    const child = spawn('codex', ['exec', '--json', '--sandbox', 'read-only', smokePrompt], {
+    const child = spawnProcess('codex', ['exec', '--json', '--sandbox', 'read-only', smokePrompt], {
       cwd: process.cwd(),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdoutBuffer = '';
     let stderr = '';
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // The timeout result remains authoritative if the child already exited.
+      }
+      resolve({
+        code: 124,
+        stderr: `Codex smoke command timed out after ${timeoutMs}ms`,
+        timedOut: true,
+      });
+    }, timeoutMs);
 
     child.stdout.on('data', (data) => {
       const lines = (stdoutBuffer + data.toString()).split('\n');
@@ -47,8 +68,16 @@ function runCodexSmoke({ eventsFile: _eventsFile, onLine }) {
     child.stderr.on('data', (data) => {
       stderr += data.toString();
     });
-    child.on('error', reject);
+    child.on('error', (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(error);
+    });
     child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
       if (stdoutBuffer) onLine(stdoutBuffer);
       resolve({ code, stderr: stderr.trim() });
     });
@@ -72,6 +101,8 @@ async function runSmoke({
   reportError = console.error,
   getVersion = installedCodexVersion,
   runProvider = runCodexSmoke,
+  timeoutMs = DEFAULT_SMOKE_TIMEOUT_MS,
+  spawnProcess = spawn,
 } = {}) {
   if (env[ACTIVATION_ENV] !== '1') {
     log(
@@ -89,7 +120,12 @@ async function runSmoke({
   const observer = createCodexSubagentObserver({ eventsFile });
 
   try {
-    const result = await runProvider({ eventsFile, onLine: observer.observeLine });
+    const result = await runProvider({
+      eventsFile,
+      onLine: observer.observeLine,
+      timeoutMs,
+      spawnProcess,
+    });
     observer.finishParent();
     const records = countRecords(eventsFile);
     if (records === 0) {
@@ -126,4 +162,4 @@ if (require.main === module) {
   );
 }
 
-module.exports = { runSmoke };
+module.exports = { runCodexSmoke, runSmoke };

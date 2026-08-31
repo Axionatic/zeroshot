@@ -12,6 +12,7 @@ function makeAgent(id = 'test-agent') {
     worktree: null,
     isolation: null,
     _log() {},
+    _parseResultOutput: () => Promise.resolve({ ok: true }),
   };
 }
 
@@ -57,7 +58,15 @@ describe('handleStatusCompletion stale + empty output guard', () => {
     assert.strictEqual(result, false);
   });
 
-  it('returns true (resolves) when stale with non-empty output', () => {
+  it('returns true and finalizes exactly once before resolving stale output', async () => {
+    const sequence = [];
+    let resolveResult;
+    const settled = new Promise((resolve) => {
+      resolveResult = (value) => {
+        sequence.push('resolve');
+        resolve(value);
+      };
+    });
     const result = handleStatusCompletion({
       agent: makeAgent(),
       taskId: 'task-1',
@@ -65,13 +74,24 @@ describe('handleStatusCompletion stale + empty output guard', () => {
       state: makeState('some task output here'),
       stdout: 'Status: stale',
       pollLogFile: () => {},
-      resolve: () => {},
+      resolve: resolveResult,
+      finalize: () => sequence.push('finalize'),
     });
 
     assert.strictEqual(result, true, 'should return true when stale with output');
+    await settled;
+    assert.deepStrictEqual(sequence, ['finalize', 'resolve']);
   });
 
-  it('returns true (resolves) when completed regardless of output', () => {
+  it('returns true and finalizes exactly once before resolving completed output', async () => {
+    const sequence = [];
+    let resolveResult;
+    const settled = new Promise((resolve) => {
+      resolveResult = (value) => {
+        sequence.push('resolve');
+        resolve(value);
+      };
+    });
     const result = handleStatusCompletion({
       agent: makeAgent(),
       taskId: 'task-1',
@@ -79,13 +99,24 @@ describe('handleStatusCompletion stale + empty output guard', () => {
       state: makeState(''),
       stdout: 'Status: completed',
       pollLogFile: () => {},
-      resolve: () => {},
+      resolve: resolveResult,
+      finalize: () => sequence.push('finalize'),
     });
 
     assert.strictEqual(result, true, 'completed status should always resolve');
+    await settled;
+    assert.deepStrictEqual(sequence, ['finalize', 'resolve']);
   });
 
-  it('returns true (resolves) when failed regardless of output', () => {
+  it('returns true and finalizes exactly once before resolving failed output', async () => {
+    const sequence = [];
+    let resolveResult;
+    const settled = new Promise((resolve) => {
+      resolveResult = (value) => {
+        sequence.push('resolve');
+        resolve(value);
+      };
+    });
     const result = handleStatusCompletion({
       agent: makeAgent(),
       taskId: 'task-1',
@@ -93,10 +124,13 @@ describe('handleStatusCompletion stale + empty output guard', () => {
       state: makeState(''),
       stdout: 'Status: failed',
       pollLogFile: () => {},
-      resolve: () => {},
+      resolve: resolveResult,
+      finalize: () => sequence.push('finalize'),
     });
 
     assert.strictEqual(result, true, 'failed status should always resolve');
+    await settled;
+    assert.deepStrictEqual(sequence, ['finalize', 'resolve']);
   });
 
   it('returns false when status is not terminal', () => {

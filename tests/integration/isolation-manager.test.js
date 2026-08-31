@@ -12,10 +12,11 @@
  */
 
 const assert = require('assert');
+const { EventEmitter } = require('events');
 const fs = require('fs');
 const { getSubagentEventsDir, getSubagentEventsFile } = require('../../src/subagent-events');
 const { SubagentTracker } = require('../../src/subagent-tracker');
-const { runSmoke } = require('../../scripts/smoke-codex-subagents');
+const { runCodexSmoke, runSmoke } = require('../../scripts/smoke-codex-subagents');
 const IsolationManager = require('../../src/isolation-manager');
 
 describe('IsolationManager', function () {
@@ -254,5 +255,28 @@ describe('Codex subagent smoke script', function () {
 
     assert.match(output.join('\n'), /CODEX_SUBAGENT_SMOKE=1/);
     assert.match(output.join('\n'), /provider invocation was not run/i);
+  });
+
+  it('terminates an activated provider child at the injected timeout', async function () {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    const signals = [];
+    child.kill = (signal) => {
+      signals.push(signal);
+      return true;
+    };
+
+    const result = await runCodexSmoke({
+      eventsFile: '/tmp/not-used-by-provider-runner.jsonl',
+      onLine: () => {},
+      timeoutMs: 5,
+      spawnProcess: () => child,
+    });
+
+    assert.deepStrictEqual(signals, ['SIGTERM']);
+    assert.strictEqual(result.code, 124);
+    assert.strictEqual(result.timedOut, true);
+    assert.match(result.stderr, /timed out after 5ms/i);
   });
 });

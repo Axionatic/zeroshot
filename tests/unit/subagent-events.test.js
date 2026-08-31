@@ -34,6 +34,21 @@ describe('subagent event helpers', () => {
     }
   });
 
+  it('creates private event directories and files', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'subagent-events-'));
+    const eventsDir = path.join(root, 'private-events');
+    const filePath = path.join(eventsDir, 'parent.jsonl');
+
+    try {
+      appendSubagentEvent(filePath, { event: 'start', agent_id: 'child-1', ts: 123 });
+
+      assert.strictEqual(fs.statSync(eventsDir).mode & 0o777, 0o700);
+      assert.strictEqual(fs.statSync(filePath).mode & 0o777, 0o600);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('does not throw when an event cannot be serialized', () => {
     const event = {};
     event.self = event;

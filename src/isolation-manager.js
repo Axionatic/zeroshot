@@ -167,7 +167,8 @@ class IsolationManager {
     const subagentEventsPath = getSubagentEventsDir(clusterId);
     let subagentEventsDir = null;
     try {
-      fs.mkdirSync(subagentEventsPath, { recursive: true });
+      fs.mkdirSync(subagentEventsPath, { recursive: true, mode: 0o700 });
+      fs.chmodSync(subagentEventsPath, 0o700);
       subagentEventsDir = subagentEventsPath;
     } catch (error) {
       console.warn(
@@ -1080,10 +1081,17 @@ class IsolationManager {
 
     const subagentHookScriptSrc = path.join(__dirname, '..', 'cluster-hooks', 'track-subagents.py');
     const subagentHookScriptDst = path.join(hooksDir, 'track-subagents.py');
-    const hasSubagentHook = fs.existsSync(subagentHookScriptSrc);
-    if (hasSubagentHook) {
-      fs.copyFileSync(subagentHookScriptSrc, subagentHookScriptDst);
-      fs.chmodSync(subagentHookScriptDst, 0o755);
+    let hasSubagentHook = false;
+    try {
+      if (fs.existsSync(subagentHookScriptSrc)) {
+        fs.copyFileSync(subagentHookScriptSrc, subagentHookScriptDst);
+        fs.chmodSync(subagentHookScriptDst, 0o755);
+        hasSubagentHook = true;
+      }
+    } catch (error) {
+      console.warn(
+        `[IsolationManager] Could not install optional subagent tracking hook: ${error.message}`
+      );
     }
 
     // Create settings.json with PreToolUse hook to block AskUserQuestion

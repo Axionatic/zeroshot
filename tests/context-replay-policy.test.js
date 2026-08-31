@@ -223,9 +223,12 @@ describe('normal Codex subagent observer lifecycle', function () {
   it('drains the final default-json record before successful settlement', async () => {
     const logFile = path.join(tempDir, 'task.jsonl');
     writeFinalRecordWithoutNewline(logFile, 'success-child');
+    const published = [];
+    const agent = makeAgent();
+    agent._publish = (message) => published.push(message.content.data.line);
 
     const result = await createLogFollower({
-      agent: makeAgent(),
+      agent,
       taskId: 'task-success',
       fsModule: fs,
       ctPath: 'unused-test-command',
@@ -236,6 +239,11 @@ describe('normal Codex subagent observer lifecycle', function () {
     });
 
     assert.strictEqual(result.success, true);
+    assert.strictEqual(result.output.includes('success-child'), false);
+    assert.strictEqual(
+      published.some((line) => line.includes('success-child')),
+      false
+    );
     assert.deepStrictEqual(readLifecycle(), [
       { event: 'start', agent_id: 'success-child' },
       { event: 'stop', agent_id: 'success-child' },
@@ -246,6 +254,8 @@ describe('normal Codex subagent observer lifecycle', function () {
     const logFile = path.join(tempDir, 'task.jsonl');
     writeFinalRecordWithoutNewline(logFile, 'killed-child');
     const agent = makeAgent();
+    const published = [];
+    agent._publish = (message) => published.push(message.content.data.line);
 
     const resultPromise = createLogFollower({
       agent,
@@ -262,6 +272,8 @@ describe('normal Codex subagent observer lifecycle', function () {
 
     assert.strictEqual(result.success, false);
     assert.strictEqual(result.error, 'manual kill');
+    assert.strictEqual(result.output, '');
+    assert.deepStrictEqual(published, []);
     assert.deepStrictEqual(readLifecycle(), [
       { event: 'start', agent_id: 'killed-child' },
       { event: 'stop', agent_id: 'killed-child' },
@@ -275,8 +287,11 @@ describe('normal Codex subagent observer lifecycle', function () {
     let result;
     try {
       console.error = () => {};
+      const agent = makeAgent();
+      const published = [];
+      agent._publish = (message) => published.push(message.content.data.line);
       result = await createLogFollower({
-        agent: makeAgent(),
+        agent,
         taskId: 'task-polling-error',
         fsModule: fs,
         ctPath: 'unused-test-command',
@@ -286,6 +301,11 @@ describe('normal Codex subagent observer lifecycle', function () {
         runStatusCommand: (_command, _args, _options, callback) =>
           callback(new Error('status unavailable'), '', 'offline'),
       });
+      assert.strictEqual(result.output.includes('polling-child'), false);
+      assert.strictEqual(
+        published.some((line) => typeof line === 'string' && line.includes('polling-child')),
+        false
+      );
     } finally {
       console.error = originalConsoleError;
     }
@@ -339,7 +359,7 @@ describe('normal Codex lifecycle without an observer', function () {
     );
   }
 
-  it('preserves Codex completion, exhaustion, and kill semantics when observer construction fails', async () => {
+  it('does not change canonical Codex output when observer construction fails', async () => {
     let constructionAttempts = 0;
     const observerFactory = () => {
       constructionAttempts++;
@@ -406,11 +426,11 @@ describe('normal Codex lifecycle without an observer', function () {
     const killed = await killedPromise;
 
     assert.strictEqual(completed.success, true);
-    assert.match(parsedOutput, /completed-without-observer/);
-    assert.match(completed.output, /completed-without-observer/);
-    assert.match(exhausted.output, /exhausted-without-observer/);
+    assert.doesNotMatch(parsedOutput, /completed-without-observer/);
+    assert.doesNotMatch(completed.output, /completed-without-observer/);
+    assert.doesNotMatch(exhausted.output, /exhausted-without-observer/);
     assert.strictEqual(killed.error, 'manual kill without observer');
-    assert.match(killed.output, /killed-without-observer/);
+    assert.doesNotMatch(killed.output, /killed-without-observer/);
     assert.strictEqual(constructionAttempts, 3);
   });
 });

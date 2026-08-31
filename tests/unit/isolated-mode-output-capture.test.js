@@ -16,6 +16,7 @@ const Orchestrator = require('../../src/orchestrator');
 const IsolationManager = require('../../src/isolation-manager');
 const {
   followClaudeTaskLogsIsolated,
+  killTask,
   spawnClaudeTaskIsolated,
 } = require('../../src/agent/agent-task-executor');
 const { getSubagentEventsDir, getSubagentEventsFile } = require('../../src/subagent-events');
@@ -114,6 +115,8 @@ describe('isolated Claude subagent tracking handoff', () => {
       spawnInContainer(receivedClusterId, _command, { env }) {
         assert.strictEqual(receivedClusterId, clusterId);
         assert.strictEqual(fs.existsSync(eventsFile), true);
+        assert.strictEqual(fs.statSync(eventsDir).mode & 0o777, 0o700);
+        assert.strictEqual(fs.statSync(eventsFile).mode & 0o777, 0o600);
         receivedEnv = env;
         throw new Error('stop after inspecting spawn handoff');
       },
@@ -158,6 +161,7 @@ describe('isolated Claude subagent tracking handoff', () => {
     try {
       await manager.createContainer(clusterId, { workDir: '/workspace-source', provider: 'codex' });
       assert.ok(dockerArgs.includes(`${eventsDir}:${eventsDir}`));
+      assert.strictEqual(fs.statSync(eventsDir).mode & 0o777, 0o700);
 
       manager.spawnInContainer = (_receivedClusterId, _command, { env }) => {
         assert.strictEqual(fs.existsSync(eventsFile), true);
@@ -255,7 +259,7 @@ describe('isolated Codex subagent observer lifecycle', function () {
     );
   });
 
-  it('finalizes active children before rejecting a Codex parse error', async () => {
+  it('finalizes telemetry without changing the existing pending parse-error settlement', async () => {
     const tailProcess = new EventEmitter();
     tailProcess.stdout = new EventEmitter();
     tailProcess.stderr = new EventEmitter();
@@ -282,6 +286,10 @@ describe('isolated Codex subagent observer lifecycle', function () {
         return Promise.reject(new Error(`unexpected command: ${shell}`));
       },
     };
+    let signalParseCalled;
+    const parseCalled = new Promise((resolve) => {
+      signalParseCalled = resolve;
+    });
     const agent = {
       id: agentId,
       role: 'worker',
@@ -292,14 +300,26 @@ describe('isolated Codex subagent observer lifecycle', function () {
       isolation: { manager, clusterId },
       messageBus: { publish: () => {} },
       _resolveProvider: () => 'codex',
-      _parseResultOutput: () => Promise.reject(new Error('invalid Codex result')),
+      _parseResultOutput: () => {
+        signalParseCalled();
+        return Promise.reject(new Error('invalid Codex result'));
+      },
       _log: () => {},
     };
 
-    await assert.rejects(
-      () => followClaudeTaskLogsIsolated(agent, 'task-parse-error'),
-      /invalid Codex result/
-    );
+    const taskPromise = followClaudeTaskLogsIsolated(agent, 'task-parse-error', {
+      statusIntervalMs: 5,
+    });
+    await parseCalled;
+    const outcome = await Promise.race([
+      taskPromise.then(
+        () => 'resolved',
+        () => 'rejected'
+      ),
+      new Promise((resolve) => setTimeout(() => resolve('pending'), 20)),
+    ]);
+
+    assert.strictEqual(outcome, 'pending');
 
     const events = fs
       .readFileSync(eventsFile, 'utf8')
@@ -339,7 +359,7 @@ describe('isolated Codex setup settlement', function () {
 
     assert.strictEqual(probe.finishCount, 1);
     assert.deepStrictEqual(probe.sequence, ['finish']);
-    assert.strictEqual(agent.currentTask, null);
+    assert.strictEqual(agent.currentTask, undefined);
   });
 
   it('finalizes once when get-log-path rejects asynchronously', async () => {
@@ -356,7 +376,7 @@ describe('isolated Codex setup settlement', function () {
 
     assert.strictEqual(probe.finishCount, 1);
     assert.deepStrictEqual(probe.sequence, ['finish']);
-    assert.strictEqual(agent.currentTask, null);
+    assert.strictEqual(agent.currentTask, undefined);
   });
 
   it('finalizes once for a non-zero get-log-path result', async () => {
@@ -373,7 +393,7 @@ describe('isolated Codex setup settlement', function () {
 
     assert.strictEqual(probe.finishCount, 1);
     assert.deepStrictEqual(probe.sequence, ['finish']);
-    assert.strictEqual(agent.currentTask, null);
+    assert.strictEqual(agent.currentTask, undefined);
   });
 
   it('finalizes once for an empty get-log-path result', async () => {
@@ -390,10 +410,10 @@ describe('isolated Codex setup settlement', function () {
 
     assert.strictEqual(probe.finishCount, 1);
     assert.deepStrictEqual(probe.sequence, ['finish']);
-    assert.strictEqual(agent.currentTask, null);
+    assert.strictEqual(agent.currentTask, undefined);
   });
 
-  it('installs kill before a pending get-log-path lookup and finalizes once', async () => {
+  it('does not add Codex-only kill or timeout settlement while log lookup is pending', async () => {
     const probe = createObserverProbe();
     let lookupStarted = false;
     const manager = {
@@ -402,7 +422,7 @@ describe('isolated Codex setup settlement', function () {
         return new Promise(() => {});
       },
     };
-    const { agent } = createCodexAgent(manager);
+    const { agent } = createCodexAgent(manager, { timeout: 20 });
 
     const resultPromise = followClaudeTaskLogsIsolated(
       agent,
@@ -412,13 +432,18 @@ describe('isolated Codex setup settlement', function () {
     await Promise.resolve();
     await Promise.resolve();
     assert.strictEqual(lookupStarted, true);
-    assert.strictEqual(typeof agent.currentTask?.kill, 'function');
-    agent.currentTask.kill('killed during log lookup');
+    const hasCustomKill = typeof agent.currentTask?.kill === 'function';
+    const outcome = await Promise.race([
+      resultPromise.then(
+        () => 'resolved',
+        () => 'rejected'
+      ),
+      new Promise((resolve) => setTimeout(() => resolve('pending'), 40)),
+    ]);
 
-    await assert.rejects(() => resultPromise, /killed during log lookup/);
-    assert.strictEqual(probe.finishCount, 1);
-    assert.deepStrictEqual(probe.sequence, ['finish']);
-    assert.strictEqual(agent.currentTask, null);
+    assert.strictEqual(hasCustomKill, false);
+    assert.strictEqual(outcome, 'pending');
+    assert.strictEqual(probe.finishCount, 0);
   });
 });
 
@@ -429,10 +454,13 @@ describe('isolated Codex terminal settlement', function () {
     fs.rmSync(getSubagentEventsDir(codexLifecycleClusterId), { recursive: true, force: true });
   });
 
-  it('drains before timeout finalization and clears tail resources', async () => {
+  it('feeds only records not already observed by the live tail into final telemetry', async () => {
     const probe = createObserverProbe();
     const tail = createTailProbe();
-    const finalOutput = '{"type":"thread.started","thread_id":"root"}\n';
+    const rootRecord = '{"type":"thread.started","thread_id":"root"}';
+    const spawnRecord =
+      '{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["unseen-child"],"prompt":"Unseen drain"}}';
+    const finalOutput = `${rootRecord}\n${spawnRecord}\n`;
     const manager = {
       spawnInContainer: () => tail.process,
       execInContainer(_receivedClusterId, command) {
@@ -446,7 +474,43 @@ describe('isolated Codex terminal settlement', function () {
         return Promise.resolve({ code: 0, stdout: finalOutput, stderr: '' });
       },
     };
-    const { agent } = createCodexAgent(manager, { timeout: 20 });
+    const { agent, publishedLines } = createCodexAgent(manager, { timeout: 30 });
+    const taskPromise = followClaudeTaskLogsIsolated(
+      agent,
+      'task-unseen-drain',
+      observerOptions(probe)
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    tail.process.stdout.emit('data', Buffer.from(`${rootRecord}\n`));
+
+    await assert.rejects(() => taskPromise, /timeout after 30ms/);
+
+    assert.deepStrictEqual(probe.sequence, [rootRecord, spawnRecord, 'finish']);
+    assert.deepStrictEqual(publishedLines, [rootRecord]);
+  });
+
+  it('uses an observer-only final drain on the existing isolated timeout', async () => {
+    const probe = createObserverProbe();
+    const tail = createTailProbe();
+    const finalOutput = [
+      '{"type":"thread.started","thread_id":"root"}',
+      '{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["timeout-child"],"prompt":"Timeout drain"}}',
+      '',
+    ].join('\n');
+    const manager = {
+      spawnInContainer: () => tail.process,
+      execInContainer(_receivedClusterId, command) {
+        const shell = command[2];
+        if (shell.includes('get-log-path')) {
+          return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
+        }
+        if (shell.includes('zeroshot status')) {
+          return Promise.resolve({ code: 0, stdout: 'Status: running\n', stderr: '' });
+        }
+        return Promise.resolve({ code: 0, stdout: finalOutput, stderr: '' });
+      },
+    };
+    const { agent, publishedLines } = createCodexAgent(manager, { timeout: 20 });
 
     await assert.rejects(
       () => followClaudeTaskLogsIsolated(agent, 'task-timeout', observerOptions(probe)),
@@ -454,15 +518,24 @@ describe('isolated Codex terminal settlement', function () {
     );
 
     assert.strictEqual(probe.finishCount, 1);
-    assert.deepStrictEqual(probe.sequence, [finalOutput.trim(), 'finish']);
+    assert.deepStrictEqual(probe.sequence, [
+      '{"type":"thread.started","thread_id":"root"}',
+      '{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["timeout-child"],"prompt":"Timeout drain"}}',
+      'finish',
+    ]);
+    assert.deepStrictEqual(publishedLines, []);
     assert.strictEqual(tail.probe.killCount, 1);
-    assert.strictEqual(agent.currentTask, null);
+    assert.strictEqual(agent.currentTask, undefined);
   });
 
-  it('drains before status-exhaustion finalization and stops further polling', async () => {
+  it('keeps retrying status errors until the existing provider-neutral timeout', async () => {
     const probe = createObserverProbe();
     const tail = createTailProbe();
-    const finalOutput = '{"type":"thread.started","thread_id":"root"}\n';
+    const finalOutput = [
+      '{"type":"thread.started","thread_id":"root"}',
+      '{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["retry-child"],"prompt":"Retry drain"}}',
+      '',
+    ].join('\n');
     let statusCalls = 0;
     const manager = {
       spawnInContainer: () => tail.process,
@@ -478,33 +551,35 @@ describe('isolated Codex terminal settlement', function () {
         return Promise.resolve({ code: 0, stdout: finalOutput, stderr: '' });
       },
     };
-    const { agent } = createCodexAgent(manager, { timeout: 200 });
+    const { agent, publishedLines } = createCodexAgent(manager, { timeout: 45 });
 
     await assert.rejects(
       () => followClaudeTaskLogsIsolated(agent, 'task-status-exhaustion', observerOptions(probe)),
-      /isolated status unavailable/
+      /timeout after 45ms/
     );
-    const callsAtSettlement = statusCalls;
-    await new Promise((resolve) => setTimeout(resolve, 30));
 
-    assert.strictEqual(callsAtSettlement, 2);
-    assert.strictEqual(statusCalls, callsAtSettlement);
+    assert.ok(statusCalls > 2);
     assert.strictEqual(probe.finishCount, 1);
-    assert.deepStrictEqual(probe.sequence, [finalOutput.trim(), 'finish']);
+    assert.deepStrictEqual(probe.sequence, [
+      '{"type":"thread.started","thread_id":"root"}',
+      '{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["retry-child"],"prompt":"Retry drain"}}',
+      'finish',
+    ]);
+    assert.deepStrictEqual(publishedLines, []);
     assert.strictEqual(tail.probe.killCount, 1);
-    assert.strictEqual(agent.currentTask, null);
+    assert.strictEqual(agent.currentTask, undefined);
   });
 
-  it('keeps Codex exhaustion and early kill semantics when observer construction fails', async () => {
-    let constructionAttempts = 0;
-    const observerFactory = () => {
-      constructionAttempts++;
-      throw new Error('observer unavailable');
-    };
+  it('lets killTask clean up telemetry without defining isolated task settlement', async () => {
+    const probe = createObserverProbe();
     const tail = createTailProbe();
-    const finalOutput = '{"type":"thread.started","thread_id":"root"}\n';
-    let statusCalls = 0;
-    const exhaustionManager = {
+    const finalOutput = [
+      '{"type":"thread.started","thread_id":"root"}',
+      '{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["kill-child"],"prompt":"Kill drain"}}',
+      '',
+    ].join('\n');
+    let terminal = false;
+    const manager = {
       spawnInContainer: () => tail.process,
       execInContainer(_receivedClusterId, command) {
         const shell = command[2];
@@ -512,42 +587,53 @@ describe('isolated Codex terminal settlement', function () {
           return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
         }
         if (shell.includes('zeroshot status')) {
-          statusCalls++;
-          return Promise.reject(new Error('status failed without observer'));
+          return Promise.resolve({
+            code: 0,
+            stdout: terminal ? 'Status: completed\n' : 'Status: running\n',
+            stderr: '',
+          });
         }
         return Promise.resolve({ code: 0, stdout: finalOutput, stderr: '' });
       },
     };
-    const exhaustedContext = createCodexAgent(exhaustionManager, { timeout: 200 });
-
-    await assert.rejects(
-      () =>
-        followClaudeTaskLogsIsolated(exhaustedContext.agent, 'task-null-observer-exhaustion', {
-          observerFactory,
-          statusIntervalMs: 5,
-          maxStatusFailures: 2,
-        }),
-      /status failed without observer/
+    const { agent, publishedLines } = createCodexAgent(manager);
+    let settled = false;
+    const taskPromise = followClaudeTaskLogsIsolated(
+      agent,
+      'task-kill-cleanup',
+      observerOptions(probe)
     );
+    taskPromise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      }
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
 
-    const pendingManager = {
-      execInContainer: () => new Promise(() => {}),
+    killTask(agent);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const snapshot = {
+      settled,
+      sequence: [...probe.sequence],
+      publishedLines: [...publishedLines],
+      tailKills: tail.probe.killCount,
     };
-    const killedContext = createCodexAgent(pendingManager);
-    const killedPromise = followClaudeTaskLogsIsolated(
-      killedContext.agent,
-      'task-null-observer-kill',
-      { observerFactory, statusIntervalMs: 5, maxStatusFailures: 2 }
-    );
-    assert.strictEqual(typeof killedContext.agent.currentTask?.kill, 'function');
-    killedContext.agent.currentTask.kill('kill without observer');
-    await assert.rejects(() => killedPromise, /kill without observer/);
 
-    assert.strictEqual(constructionAttempts, 2);
-    assert.strictEqual(statusCalls, 2);
-    assert.deepStrictEqual(exhaustedContext.publishedLines, [finalOutput.trim()]);
-    assert.strictEqual(exhaustedContext.agent.currentTask, null);
-    assert.strictEqual(killedContext.agent.currentTask, null);
+    terminal = true;
+    const result = await taskPromise;
+
+    assert.strictEqual(snapshot.settled, false);
+    assert.deepStrictEqual(snapshot.sequence, [
+      '{"type":"thread.started","thread_id":"root"}',
+      '{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","status":"completed","sender_thread_id":"root","receiver_thread_ids":["kill-child"],"prompt":"Kill drain"}}',
+      'finish',
+    ]);
+    assert.deepStrictEqual(snapshot.publishedLines, []);
+    assert.strictEqual(snapshot.tailKills, 0);
+    assert.strictEqual(result.success, true);
   });
 });
 

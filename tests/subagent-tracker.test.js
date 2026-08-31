@@ -88,6 +88,33 @@ describe('SubagentTracker', () => {
     assert.strictEqual(active[1].id, 'sub-2');
   });
 
+  it('ignores invalid event records before creating parent state', () => {
+    const tracker = new SubagentTracker(TEST_CLUSTER_ID);
+    const filePath = path.join(BASE_DIR, 'analyst.jsonl');
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const invalidRecords = [
+      null,
+      [],
+      {},
+      { event: 'launch', agent_id: 'sub-1', ts: 1000 },
+      { event: 'start', agent_id: '', ts: 1000 },
+      { event: 'start', agent_id: '   ', ts: 1000 },
+      { event: 'start', agent_id: 'sub-1', ts: '1000' },
+      { event: 'start', agent_id: 'sub-1', ts: null },
+      { event: 'start', agent_id: 'sub-1', description: null, ts: 1000 },
+      { event: 'start', agent_id: 'sub-1', agent_type: 7, ts: 1000 },
+    ];
+    fs.writeFileSync(
+      filePath,
+      `${invalidRecords.map((record) => JSON.stringify(record)).join('\n')}\n` +
+        '{"event":"start","agent_id":"sub-infinite","ts":1e309}\n'
+    );
+
+    assert.doesNotThrow(() => tracker.poll());
+    assert.strictEqual(tracker.active.size, 0);
+    assert.deepStrictEqual(tracker.getActiveSubagents('analyst'), []);
+  });
+
   it('offset tracking works on re-poll (no duplicate events)', () => {
     const tracker = new SubagentTracker(TEST_CLUSTER_ID);
 

@@ -421,6 +421,43 @@ function registerSubagentTrackingIsolationTests() {
       );
     });
 
+    for (const failedOperation of ['copyFileSync', 'chmodSync']) {
+      it(`keeps the required AskUserQuestion hook when optional tracking ${failedOperation} fails`, function () {
+        const failedClusterId = `${clusterId}-${failedOperation}`;
+        const original = fs[failedOperation];
+        fs[failedOperation] = (...args) => {
+          if (String(args[0]).endsWith('track-subagents.py')) {
+            throw new Error(`simulated ${failedOperation} failure`);
+          }
+          return original(...args);
+        };
+
+        let failedConfigDir;
+        try {
+          assert.doesNotThrow(() => {
+            failedConfigDir = manager._createClusterConfigDir(failedClusterId, containerHome);
+          });
+        } finally {
+          fs[failedOperation] = original;
+        }
+
+        try {
+          const settings = JSON.parse(
+            fs.readFileSync(path.join(failedConfigDir, 'settings.json'), 'utf8')
+          );
+          const askCommand = settings.hooks.PreToolUse[0].hooks[0].command;
+          assert.strictEqual(
+            askCommand,
+            `${containerHome}/.claude/hooks/block-ask-user-question.py`
+          );
+          assert.strictEqual(settings.hooks.SubagentStart, undefined);
+          assert.strictEqual(settings.hooks.SubagentStop, undefined);
+        } finally {
+          manager._cleanupClusterConfigDir(failedClusterId);
+        }
+      });
+    }
+
     it('mounts the writable cluster event directory into the isolated container', function () {
       const eventsDir = getSubagentEventsDir(clusterId);
       const args = manager._buildBaseDockerArgs({
