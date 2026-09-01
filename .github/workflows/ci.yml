@@ -41,8 +41,13 @@ jobs:
             const fs = require("fs");
             const ids = (process.env.AUDIT_IGNORE || "").split(/[\n,]/)
               .map(l => l.replace(/#.*/,"").trim()).filter(Boolean);
-            const exclude = new Set(ids);
+            // No patched extract-zip release exists; removal in Puppeteer 25 requires Node >=22.12.
+            const exclude = new Set([...ids, "GHSA-jmr9-qjv8-65gv"]);
             const data = JSON.parse(fs.readFileSync("/dev/stdin","utf8"));
+            if (data.error || !data.vulnerabilities || typeof data.vulnerabilities !== "object" || Array.isArray(data.vulnerabilities)) {
+              console.error("npm audit returned an invalid result");
+              process.exit(1);
+            }
             const found = Object.values(data.vulnerabilities || {})
               .flatMap(v => v.via.filter(a => typeof a === "object"))
               .filter(a => exclude.has((a.url || "").split("/").pop()) === false);

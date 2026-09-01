@@ -11,6 +11,7 @@
  */
 
 const { spawn, spawnSync } = require('child_process');
+const { StringDecoder } = require('string_decoder');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -21,6 +22,8 @@ const { resolveClaudeAuth } = require('../../lib/settings/claude-auth.js');
 const { prependWorktreeToolBinToEnv } = require('../worktree-tooling-env.js');
 const { prepareClaudeConfigDir } = require('../worktree-claude-config.js');
 const { buildRawLogOnlyMetadata } = require('./context-replay-policy');
+const { getSubagentEventsFile, prepareSharedSubagentEventsFile } = require('../subagent-events');
+const { createCodexSubagentObserver } = require('../codex-subagent-observer');
 
 function runCommandWithTimeout(command, args, options = {}, callback = null) {
   const timeout = options.timeout ?? 30000;
@@ -368,6 +371,7 @@ function extractErrorContext({ output, statusOutput, taskId, isNotFound = false,
 // Track which config dirs already have zeroshot-installed hooks.
 const askUserQuestionHookInstalledDirs = new Set();
 const dangerousGitHookInstalledDirs = new Set();
+const subagentTrackingHookInstalledDirs = new Set();
 
 /**
  * Extract token usage from NDJSON output.
@@ -440,18 +444,23 @@ function ensureAskUserQuestionHook(targetClaudeDir = null) {
   const hookScriptName = 'block-ask-user-question.py';
   const hookScriptDst = path.join(hooksDir, hookScriptName);
 
+  const hookScriptSrc = path.join(__dirname, '..', '..', 'cluster-hooks', hookScriptName);
+  if (!fs.existsSync(hookScriptSrc)) {
+    // Registering a command that will never exist is worse than failing here:
+    // agents would block on AskUserQuestion with no hook to stop them.
+    throw new Error(
+      `Hook script missing at ${hookScriptSrc}. Check that cluster-hooks/ is listed in package.json "files".`
+    );
+  }
+
   // Ensure hooks directory exists
   if (!fs.existsSync(hooksDir)) {
     fs.mkdirSync(hooksDir, { recursive: true });
   }
 
-  // Copy hook script if not present or outdated
-  const hookScriptSrc = path.join(__dirname, '..', '..', 'hooks', hookScriptName);
-  if (fs.existsSync(hookScriptSrc)) {
-    // Always copy to ensure latest version
-    fs.copyFileSync(hookScriptSrc, hookScriptDst);
-    fs.chmodSync(hookScriptDst, 0o755);
-  }
+  // Always copy to ensure latest version
+  fs.copyFileSync(hookScriptSrc, hookScriptDst);
+  fs.chmodSync(hookScriptDst, 0o755);
 
   // Read existing settings or create new
   let settings = {};
@@ -464,19 +473,24 @@ function ensureAskUserQuestionHook(targetClaudeDir = null) {
     }
   }
 
-  // Ensure hooks structure exists
-  if (!settings.hooks) {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+    settings = {};
+  }
+
+  // Ensure hooks structure exists. A hand-edited settings.json can hold any
+  // shape here, and a throw would abort an otherwise healthy agent run.
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
     settings.hooks = {};
   }
-  if (!settings.hooks.PreToolUse) {
+  if (!Array.isArray(settings.hooks.PreToolUse)) {
     settings.hooks.PreToolUse = [];
   }
 
   // Check if AskUserQuestion hook already exists
   const hasHook = settings.hooks.PreToolUse.some(
     (entry) =>
-      entry.matcher === 'AskUserQuestion' ||
-      (entry.hooks && entry.hooks.some((h) => h.command && h.command.includes(hookScriptName)))
+      entry?.matcher === 'AskUserQuestion' ||
+      entry?.hooks?.some?.((h) => h?.command && h.command.includes(hookScriptName))
   );
 
   if (!hasHook) {
@@ -518,18 +532,23 @@ function ensureDangerousGitHook(targetClaudeDir = null) {
   const hookScriptName = 'block-dangerous-git.py';
   const hookScriptDst = path.join(hooksDir, hookScriptName);
 
+  const hookScriptSrc = path.join(__dirname, '..', '..', 'cluster-hooks', hookScriptName);
+  if (!fs.existsSync(hookScriptSrc)) {
+    // Registering a command that will never exist is worse than failing here:
+    // worktree agents would run unguarded against dangerous git commands.
+    throw new Error(
+      `Hook script missing at ${hookScriptSrc}. Check that cluster-hooks/ is listed in package.json "files".`
+    );
+  }
+
   // Ensure hooks directory exists
   if (!fs.existsSync(hooksDir)) {
     fs.mkdirSync(hooksDir, { recursive: true });
   }
 
-  // Copy hook script if not present or outdated
-  const hookScriptSrc = path.join(__dirname, '..', '..', 'hooks', hookScriptName);
-  if (fs.existsSync(hookScriptSrc)) {
-    // Always copy to ensure latest version
-    fs.copyFileSync(hookScriptSrc, hookScriptDst);
-    fs.chmodSync(hookScriptDst, 0o755);
-  }
+  // Always copy to ensure latest version
+  fs.copyFileSync(hookScriptSrc, hookScriptDst);
+  fs.chmodSync(hookScriptDst, 0o755);
 
   // Read existing settings or create new
   let settings = {};
@@ -542,20 +561,24 @@ function ensureDangerousGitHook(targetClaudeDir = null) {
     }
   }
 
-  // Ensure hooks structure exists
-  if (!settings.hooks) {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+    settings = {};
+  }
+
+  // Ensure hooks structure exists. A hand-edited settings.json can hold any
+  // shape here, and a throw would abort an otherwise healthy agent run.
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
     settings.hooks = {};
   }
-  if (!settings.hooks.PreToolUse) {
+  if (!Array.isArray(settings.hooks.PreToolUse)) {
     settings.hooks.PreToolUse = [];
   }
 
   // Check if dangerous git hook already exists
   const hasHook = settings.hooks.PreToolUse.some(
     (entry) =>
-      entry.matcher === 'Bash' &&
-      entry.hooks &&
-      entry.hooks.some((h) => h.command && h.command.includes(hookScriptName))
+      entry?.matcher === 'Bash' &&
+      entry.hooks?.some?.((h) => h?.command && h.command.includes(hookScriptName))
   );
 
   if (!hasHook) {
@@ -576,6 +599,106 @@ function ensureDangerousGitHook(targetClaudeDir = null) {
   }
 
   dangerousGitHookInstalledDirs.add(userClaudeDir);
+}
+
+/**
+ * Ensure the subagent tracking hook is installed in user's Claude config.
+ * Writes JSONL start/stop events that SubagentTracker/StatusFooter render.
+ * Modifies ~/.claude/settings.json and copies hook script to ~/.claude/hooks/
+ *
+ * Unlike the two hooks above this registers on two lifecycle events
+ * (SubagentStart + SubagentStop) rather than a single PreToolUse matcher.
+ *
+ * Safe to call multiple times - only modifies config once per process.
+ */
+function ensureSubagentTrackingHook(targetClaudeDir = null) {
+  const userClaudeDir =
+    targetClaudeDir || process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+  if (subagentTrackingHookInstalledDirs.has(userClaudeDir)) {
+    return;
+  }
+  const hooksDir = path.join(userClaudeDir, 'hooks');
+  const settingsPath = path.join(userClaudeDir, 'settings.json');
+  const hookScriptName = 'track-subagents.py';
+  const hookScriptDst = path.join(hooksDir, hookScriptName);
+
+  // Resolve via the real directory, not the repo's hooks -> cluster-hooks
+  // symlink: npm pack drops symlinks, so `hooks/` does not exist in an
+  // installed package.
+  const hookScriptSrc = path.join(__dirname, '..', '..', 'cluster-hooks', hookScriptName);
+  if (!fs.existsSync(hookScriptSrc)) {
+    // Registering a command that will never exist is worse than not tracking -
+    // Claude would try to run a missing file on every subagent spawn.
+    subagentTrackingHookInstalledDirs.add(userClaudeDir);
+    return;
+  }
+
+  try {
+    // Ensure hooks directory exists
+    if (!fs.existsSync(hooksDir)) {
+      fs.mkdirSync(hooksDir, { recursive: true });
+    }
+
+    // Always copy to ensure latest version
+    fs.copyFileSync(hookScriptSrc, hookScriptDst);
+    fs.chmodSync(hookScriptDst, 0o755);
+
+    // Read existing settings or create new
+    let settings = {};
+    if (fs.existsSync(settingsPath)) {
+      try {
+        settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+      } catch (e) {
+        console.warn(
+          `[AgentTaskExecutor] Could not parse settings.json, creating new: ${e.message}`
+        );
+        settings = {};
+      }
+    }
+
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+      settings = {};
+    }
+
+    // Ensure hooks structure exists. A hand-edited settings.json can hold any
+    // shape here, and a throw would abort an otherwise healthy agent run.
+    if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
+      settings.hooks = {};
+    }
+
+    // Tracking needs both ends of the subagent lifecycle to render a live tree.
+    let changed = false;
+    for (const event of ['SubagentStart', 'SubagentStop']) {
+      if (!Array.isArray(settings.hooks[event])) {
+        settings.hooks[event] = [];
+      }
+      const hasHook = settings.hooks[event].some((entry) =>
+        entry?.hooks?.some?.((h) => h?.command && h.command.includes(hookScriptName))
+      );
+      if (!hasHook) {
+        settings.hooks[event].push({
+          hooks: [
+            {
+              type: 'command',
+              command: hookScriptDst,
+            },
+          ],
+        });
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+      console.log(`[AgentTaskExecutor] Installed subagent tracking hook in ${settingsPath}`);
+    }
+  } catch (error) {
+    console.warn(
+      `[AgentTaskExecutor] Could not install optional subagent tracking hook: ${error.message}`
+    );
+  }
+
+  subagentTrackingHookInstalledDirs.add(userClaudeDir);
 }
 
 /**
@@ -659,10 +782,18 @@ async function spawnClaudeTask(agent, context) {
     spawnEnv,
   });
 
+  if (!agent.running) {
+    throw new Error(`Agent ${agent.id} stopped before task startup completed`);
+  }
+
   agent._log(`📋 Agent ${agent.id}: Following zeroshot logs for ${taskId}`);
 
   // Wait for task to be registered in zeroshot storage (race condition fix)
   await waitForTaskReady(agent, taskId);
+
+  if (!agent.running) {
+    throw new Error(`Agent ${agent.id} stopped before task startup completed`);
+  }
 
   // CRITICAL: Poll for REAL process PID from task store
   // The watcher spawns the actual CLI and writes PID to SQLite asynchronously.
@@ -672,12 +803,19 @@ async function spawnClaudeTask(agent, context) {
   let realPid = null;
 
   for (let i = 0; i < MAX_PID_POLLS; i++) {
+    if (!agent.running) {
+      throw new Error(`Agent ${agent.id} stopped before task startup completed`);
+    }
     const taskInfo = getTask(taskId);
     if (taskInfo?.pid) {
       realPid = taskInfo.pid;
       break;
     }
     await new Promise((r) => setTimeout(r, PID_POLL_DELAY));
+  }
+
+  if (!agent.running) {
+    throw new Error(`Agent ${agent.id} stopped before task startup completed`);
   }
 
   if (realPid) {
@@ -773,6 +911,9 @@ function ensureProviderHooks(agent, providerName, claudeConfigDir = null) {
 
   ensureAskUserQuestionHook(claudeConfigDir);
 
+  // Producer side of the ZEROSHOT_TRACK_SUBAGENTS wiring in buildSpawnEnv()
+  ensureSubagentTrackingHook(claudeConfigDir);
+
   // WORKTREE MODE: Install git safety hook (blocks dangerous git commands)
   if (agent.worktree?.enabled) {
     ensureDangerousGitHook(claudeConfigDir);
@@ -816,11 +957,9 @@ function buildSpawnEnv(agent, providerName, modelSpec, options = {}) {
 
     // SUBAGENT TRACKING: Activate hook that writes JSONL events for StatusFooter display
     spawnEnv.ZEROSHOT_TRACK_SUBAGENTS = '1';
-    spawnEnv.ZEROSHOT_SUBAGENT_EVENTS_FILE = path.join(
-      os.tmpdir(),
-      'zeroshot-subagents',
+    spawnEnv.ZEROSHOT_SUBAGENT_EVENTS_FILE = getSubagentEventsFile(
       agent.cluster?.id || 'unknown',
-      `${agent.id}.jsonl`
+      agent.id
     );
   }
 
@@ -901,6 +1040,14 @@ function spawnTaskProcess({ agent, ctPath, args, cwd, spawnEnv }) {
         const spawnedTaskId = parseTaskIdFromOutput(stdout);
         if (spawnedTaskId) {
           agent.currentTaskId = spawnedTaskId; // Track for resume capability
+          if (!agent.running) {
+            Promise.resolve(agent._killTask())
+              .then(() =>
+                reject(new Error(`Agent ${agent.id} stopped before task startup completed`))
+              )
+              .catch((error) => reject(error));
+            return;
+          }
           agent._publishLifecycle('TASK_ID_ASSIGNED', {
             pid: agent.processPid,
             taskId: spawnedTaskId,
@@ -974,6 +1121,7 @@ function createLogFollowState() {
     pollInterval: null,
     statusCheckInterval: null,
     resolved: false,
+    finalized: false,
     lineBuffer: '',
     consecutiveExecFailures: 0,
   };
@@ -1025,10 +1173,50 @@ function isValidJsonLine(content) {
   }
 }
 
-function broadcastAgentLine({ agent, providerName, state, line }) {
+function observeCodexLine(observer, line) {
+  try {
+    observer?.observeLine(line);
+  } catch {
+    // Best-effort telemetry must not affect provider output handling.
+  }
+}
+
+function finishCodexObserver(observer) {
+  try {
+    observer?.finishParent();
+  } catch {
+    // Best-effort telemetry must not affect provider settlement.
+  }
+}
+
+function createCodexObserverForFollower(
+  agent,
+  providerName,
+  clusterId = null,
+  observerFactory = createCodexSubagentObserver
+) {
+  if (providerName !== 'codex') return null;
+  try {
+    const resolvedClusterId =
+      clusterId ||
+      agent.cluster?.id ||
+      agent.cluster_id ||
+      process.env.ZEROSHOT_CLUSTER_ID ||
+      'unknown';
+    return observerFactory({
+      parentAgentId: agent.id,
+      eventsFile: getSubagentEventsFile(resolvedClusterId, agent.id),
+    });
+  } catch {
+    return null;
+  }
+}
+
+function broadcastAgentLine({ agent, providerName, state, line, observer = null }) {
   if (!line.trim()) return;
 
   const { timestamp, content } = parseTimestampedLine(line);
+  observeCodexLine(observer, content);
   if (shouldSkipLogLine(content)) {
     return;
   }
@@ -1066,6 +1254,34 @@ function appendContentToBuffer(state, content, onLine) {
   }
 
   state.lineBuffer = lines[lines.length - 1];
+}
+
+function drainNormalObserver({ fsModule, state, observer }) {
+  if (!observer) return;
+
+  let unseenContent = state.lineBuffer || '';
+  try {
+    if (state.logFilePath && fsModule.existsSync(state.logFilePath)) {
+      const currentSize = fsModule.statSync(state.logFilePath).size;
+      if (currentSize > state.lastSize) {
+        const fd = fsModule.openSync(state.logFilePath, 'r');
+        try {
+          const buffer = Buffer.alloc(currentSize - state.lastSize);
+          fsModule.readSync(fd, buffer, 0, buffer.length, state.lastSize);
+          unseenContent += buffer.toString('utf8');
+        } finally {
+          fsModule.closeSync(fd);
+        }
+      }
+    }
+  } catch {
+    // The already-buffered trailing record can still be observed below.
+  }
+
+  for (const line of unseenContent.split('\n')) {
+    if (!line.trim()) continue;
+    observeCodexLine(observer, parseTimestampedLine(line).content);
+  }
 }
 
 function pollLogFileForUpdates({ agent, fsModule, ctPath, taskId, state, onNewContent }) {
@@ -1111,6 +1327,7 @@ function parseStatusFlags(cleanStdout) {
     isCompleted: /Status:\s+completed/i.test(cleanStdout),
     isFailed: /Status:\s+failed/i.test(cleanStdout),
     isStale: /Status:\s+stale/i.test(cleanStdout),
+    isKilled: /Status:\s+killed/i.test(cleanStdout),
   };
 }
 
@@ -1194,7 +1411,15 @@ async function buildCompletionResult({ agent, taskId, providerName, state, stdou
   };
 }
 
-function finalizeLogFollow(agent, state) {
+function finalizeLogFollow(agent, state, { drainObserver, observer } = {}) {
+  if (state.finalized) return;
+  state.finalized = true;
+  try {
+    drainObserver?.();
+  } catch {
+    // Telemetry finalization must not affect provider settlement.
+  }
+  finishCodexObserver(observer);
   if (state.pollInterval) {
     clearInterval(state.pollInterval);
   }
@@ -1204,7 +1429,17 @@ function finalizeLogFollow(agent, state) {
   agent.currentTask = null;
 }
 
-function handleStatusExecError({ agent, state, ctPath, taskId, error, stderr, resolve }) {
+function handleStatusExecError({
+  agent,
+  state,
+  ctPath,
+  taskId,
+  error,
+  stderr,
+  resolve,
+  finalize,
+  maxStatusFailures = MAX_STATUS_FAILURES,
+}) {
   if (!error) {
     return false;
   }
@@ -1231,7 +1466,7 @@ function handleStatusExecError({ agent, state, ctPath, taskId, error, stderr, re
 
     if (!state.resolved) {
       state.resolved = true;
-      finalizeLogFollow(agent, state);
+      finalize();
 
       agent._publish({
         topic: 'AGENT_ERROR',
@@ -1259,14 +1494,14 @@ function handleStatusExecError({ agent, state, ctPath, taskId, error, stderr, re
 
   state.consecutiveExecFailures++;
   agent._log(
-    `[${agent.id}] Status exec error (${state.consecutiveExecFailures}/${MAX_STATUS_FAILURES}): ${error.message || 'unknown'}`
+    `[${agent.id}] Status exec error (${state.consecutiveExecFailures}/${maxStatusFailures}): ${error.message || 'unknown'}`
   );
-  if (state.consecutiveExecFailures < MAX_STATUS_FAILURES) {
+  if (state.consecutiveExecFailures < maxStatusFailures) {
     return true;
   }
 
   console.error(
-    `[Agent ${agent.id}] ⚠️ Status polling failed ${MAX_STATUS_FAILURES} times consecutively! STOPPING.`
+    `[Agent ${agent.id}] ⚠️ Status polling failed ${maxStatusFailures} times consecutively! STOPPING.`
   );
   console.error(`  Command: ${ctPath} status ${taskId}`);
   console.error(`  Error: ${error.message}`);
@@ -1275,13 +1510,13 @@ function handleStatusExecError({ agent, state, ctPath, taskId, error, stderr, re
 
   if (!state.resolved) {
     state.resolved = true;
-    finalizeLogFollow(agent, state);
+    finalize();
 
     agent._publish({
       topic: 'AGENT_ERROR',
       receiver: 'broadcast',
       content: {
-        text: `Task ${taskId} polling failed after ${MAX_STATUS_FAILURES} consecutive failures`,
+        text: `Task ${taskId} polling failed after ${maxStatusFailures} consecutive failures`,
         data: {
           taskId,
           error: 'polling_timeout',
@@ -1295,7 +1530,7 @@ function handleStatusExecError({ agent, state, ctPath, taskId, error, stderr, re
     resolve({
       success: false,
       output: state.output,
-      error: `Status polling failed ${MAX_STATUS_FAILURES} times - task may not exist`,
+      error: `Status polling failed ${maxStatusFailures} times - task may not exist`,
     });
   }
 
@@ -1310,11 +1545,12 @@ function handleStatusCompletion({
   stdout,
   pollLogFile,
   resolve,
+  finalize,
 }) {
   const cleanStdout = stripAnsiCodes(stdout);
-  const { isCompleted, isFailed, isStale } = parseStatusFlags(cleanStdout);
+  const { isCompleted, isFailed, isStale, isKilled } = parseStatusFlags(cleanStdout);
 
-  if (!isCompleted && !isFailed && !isStale) {
+  if (!isCompleted && !isFailed && !isStale && !isKilled) {
     return false;
   }
 
@@ -1344,7 +1580,7 @@ function handleStatusCompletion({
     if (state.resolved) return;
     state.resolved = true;
 
-    finalizeLogFollow(agent, state);
+    finalize();
 
     buildCompletionResult({
       agent,
@@ -1368,12 +1604,12 @@ function handleStatusCompletion({
   return true;
 }
 
-function buildKillHandler({ agent, state, providerName, resolve }) {
+function buildKillHandler({ agent, state, providerName, resolve, finalize }) {
   return {
     kill: (reason = 'Task killed') => {
       if (state.resolved) return;
       state.resolved = true;
-      finalizeLogFollow(agent, state);
+      finalize();
       agent._stopLivenessCheck();
       resolve({
         success: false,
@@ -1385,18 +1621,32 @@ function buildKillHandler({ agent, state, providerName, resolve }) {
   };
 }
 
-function createLogFollower({ agent, taskId, fsModule, ctPath, providerName }) {
+function createLogFollower({
+  agent,
+  taskId,
+  fsModule,
+  ctPath,
+  providerName,
+  initialLogFilePath,
+  runStatusCommand = runCommandWithTimeout,
+  maxStatusFailures = MAX_STATUS_FAILURES,
+  observerFactory = createCodexSubagentObserver,
+}) {
   return new Promise((resolve) => {
     const state = createLogFollowState();
+    const isCodex = providerName === 'codex';
+    const observer = createCodexObserverForFollower(agent, providerName, null, observerFactory);
 
-    state.logFilePath = lookupLogFilePath(ctPath, taskId);
+    state.logFilePath =
+      initialLogFilePath === undefined ? lookupLogFilePath(ctPath, taskId) : initialLogFilePath;
     if (state.logFilePath) {
       agent._log(`📋 Agent ${agent.id}: Following ct logs for ${taskId}`);
     } else {
       agent._log(`⏳ Agent ${agent.id}: Waiting for log file...`);
     }
 
-    const broadcastLine = (line) => broadcastAgentLine({ agent, providerName, state, line });
+    const broadcastLine = (line) =>
+      broadcastAgentLine({ agent, providerName, state, line, observer });
     const processNewContent = (content) => appendContentToBuffer(state, content, broadcastLine);
     const pollLogFile = () =>
       pollLogFileForUpdates({
@@ -1407,36 +1657,49 @@ function createLogFollower({ agent, taskId, fsModule, ctPath, providerName }) {
         state,
         onNewContent: processNewContent,
       });
+    const finalize = () =>
+      finalizeLogFollow(agent, state, {
+        observer,
+        drainObserver: isCodex ? () => drainNormalObserver({ fsModule, state, observer }) : null,
+      });
 
     state.pollInterval = setInterval(pollLogFile, 300);
 
     state.statusCheckInterval = setInterval(() => {
-      runCommandWithTimeout(
-        ctPath,
-        ['status', taskId],
-        { timeout: 5000 },
-        (error, stdout, stderr) => {
-          if (state.resolved) return;
+      runStatusCommand(ctPath, ['status', taskId], { timeout: 5000 }, (error, stdout, stderr) => {
+        if (state.resolved) return;
 
-          if (handleStatusExecError({ agent, state, ctPath, taskId, error, stderr, resolve })) {
-            return;
-          }
-
-          state.consecutiveExecFailures = 0;
-          handleStatusCompletion({
+        if (
+          handleStatusExecError({
             agent,
-            taskId,
-            providerName,
             state,
-            stdout,
-            pollLogFile,
+            ctPath,
+            taskId,
+            error,
+            stderr,
             resolve,
-          });
+            finalize,
+            maxStatusFailures,
+          })
+        ) {
+          return;
         }
-      );
+
+        state.consecutiveExecFailures = 0;
+        handleStatusCompletion({
+          agent,
+          taskId,
+          providerName,
+          state,
+          stdout,
+          pollLogFile,
+          resolve,
+          finalize,
+        });
+      });
     }, 1000);
 
-    agent.currentTask = buildKillHandler({ agent, state, providerName, resolve });
+    agent.currentTask = buildKillHandler({ agent, state, providerName, resolve, finalize });
   });
 }
 
@@ -1525,6 +1788,18 @@ async function spawnClaudeTaskIsolated(agent, context) {
   // Note: Auth env vars are injected by IsolationManager, we only need model mapping here
   const isolatedEnv =
     providerName === 'claude' ? buildClaudeEnv(modelSpec, { includeAuth: false }) : {};
+  if (providerName === 'claude') {
+    const eventsFile = getSubagentEventsFile(clusterId, agent.id);
+    isolatedEnv.ZEROSHOT_TRACK_SUBAGENTS = '1';
+    isolatedEnv.ZEROSHOT_SUBAGENT_EVENTS_FILE = eventsFile;
+    try {
+      if (!prepareSharedSubagentEventsFile(eventsFile)) {
+        throw new Error('shared event file preparation failed');
+      }
+    } catch (error) {
+      agent._log(`⚠️ Agent ${agent.id}: Could not prepare subagent tracking: ${error.message}`);
+    }
+  }
 
   const taskId = await new Promise((resolve, reject) => {
     const proc = manager.spawnInContainer(clusterId, command, {
@@ -1575,6 +1850,14 @@ async function spawnClaudeTaskIsolated(agent, context) {
         const spawnedTaskId = parseTaskIdFromOutput(stdout);
         if (spawnedTaskId) {
           agent.currentTaskId = spawnedTaskId; // Track for resume capability
+          if (!agent.running) {
+            Promise.resolve(agent._killTask())
+              .then(() =>
+                reject(new Error(`Agent ${agent.id} stopped before task startup completed`))
+              )
+              .catch((error) => reject(error));
+            return;
+          }
           agent._publishLifecycle('TASK_ID_ASSIGNED', {
             pid: agent.processPid,
             taskId: spawnedTaskId,
@@ -1602,6 +1885,10 @@ async function spawnClaudeTaskIsolated(agent, context) {
       reject(error);
     });
   });
+
+  if (!agent.running) {
+    throw new Error(`Agent ${agent.id} stopped before task startup completed`);
+  }
 
   agent._log(`📋 Agent ${agent.id}: Following zeroshot logs for ${taskId} in container...`);
 
@@ -1635,10 +1922,19 @@ async function spawnClaudeTaskIsolated(agent, context) {
 function createIsolatedLogState() {
   return {
     taskExited: false,
+    settled: false,
+    finalizationPromise: null,
     fullOutput: '',
     tailProcess: null,
     statusCheckInterval: null,
+    statusFailureCount: 0,
+    emptyStaleCount: 0,
+    timeoutHandle: null,
+    deadlineAt: null,
     lineBuffer: '',
+    logFilePath: null,
+    tailDecoder: new StringDecoder('utf8'),
+    taskHandle: null,
   };
 }
 
@@ -1653,16 +1949,31 @@ function buildIsolatedCleanup(state) {
       state.tailProcess = null;
     }
     if (state.statusCheckInterval) {
-      clearInterval(state.statusCheckInterval);
+      clearTimeout(state.statusCheckInterval);
       state.statusCheckInterval = null;
+    }
+    if (state.timeoutHandle) {
+      clearTimeout(state.timeoutHandle);
+      state.timeoutHandle = null;
     }
   };
 }
 
-function broadcastIsolatedLine({ agent, providerName, taskId, line }) {
-  const timestampMatch = line.match(/^\[(\d{4}-\d{2}-\d{2}T[^\]]+)\]\s*(.*)$/);
-  const timestamp = timestampMatch ? new Date(timestampMatch[1]).getTime() : Date.now();
-  const content = timestampMatch ? timestampMatch[2] : line;
+function parseIsolatedTimestampedLine(line) {
+  const normalizedLine = line.replace(/\r$/, '');
+  if (/^\[\d{13}\]/.test(normalizedLine)) {
+    return parseTimestampedLine(normalizedLine);
+  }
+  const timestampMatch = normalizedLine.match(/^\[(\d{4}-\d{2}-\d{2}T[^\]]+)\]\s*(.*)$/);
+  return {
+    timestamp: timestampMatch ? new Date(timestampMatch[1]).getTime() : Date.now(),
+    content: timestampMatch ? timestampMatch[2] : normalizedLine,
+  };
+}
+
+function broadcastIsolatedLine({ agent, providerName, taskId, line, observer = null }) {
+  const { timestamp, content } = parseIsolatedTimestampedLine(line);
+  observeCodexLine(observer, content);
 
   agent.messageBus.publish({
     cluster_id: agent.cluster.id,
@@ -1704,7 +2015,8 @@ function startIsolatedTail({ agent, manager, clusterId, logFilePath, state, onLi
   ]);
 
   state.tailProcess.stdout.on('data', (data) => {
-    const chunk = data.toString();
+    const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    const chunk = state.tailDecoder.write(buffer);
     state.fullOutput += chunk;
     appendIsolatedContent(state, chunk, onLine);
   });
@@ -1727,6 +2039,156 @@ function startIsolatedTail({ agent, manager, clusterId, logFilePath, state, onLi
   });
 }
 
+async function drainIsolatedLog({ manager, clusterId, state, onLine }) {
+  if (!state.logFilePath) return;
+  const remainingMs = state.deadlineAt ? Math.max(0, state.deadlineAt - Date.now()) : null;
+  if (remainingMs === 0) {
+    const error = new Error('Task final output drain exceeded its timeout');
+    error.finalDrainTimeout = true;
+    throw error;
+  }
+  const finalReadPromise = manager.execInContainer(
+    clusterId,
+    ['sh', '-c', `cat "${state.logFilePath}" 2>/dev/null || echo ""`],
+    remainingMs === null ? {} : { timeout: remainingMs }
+  );
+  let finalReadResult;
+  if (state.deadlineAt) {
+    let drainTimeoutHandle;
+    try {
+      finalReadResult = await Promise.race([
+        finalReadPromise,
+        new Promise((_, reject) => {
+          drainTimeoutHandle = setTimeout(() => {
+            const error = new Error('Task final output drain exceeded its timeout');
+            error.finalDrainTimeout = true;
+            reject(error);
+          }, remainingMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(drainTimeoutHandle);
+    }
+  } else {
+    finalReadResult = await finalReadPromise;
+  }
+
+  if (finalReadResult.code === 0 && finalReadResult.stdout) {
+    state.fullOutput = finalReadResult.stdout;
+    for (const line of state.fullOutput.split('\n')) {
+      if (line.trim()) onLine(line);
+    }
+    state.lineBuffer = '';
+  }
+}
+
+function createIsolatedObserverFinalizer({ state, observer }) {
+  let finalizationPromise = null;
+  return () => {
+    if (finalizationPromise) return finalizationPromise;
+    try {
+      if (state.lineBuffer.trim()) {
+        observeCodexLine(observer, parseIsolatedTimestampedLine(state.lineBuffer).content);
+      }
+      finishCodexObserver(observer);
+    } catch {
+      finishCodexObserver(observer);
+    }
+    finalizationPromise = Promise.resolve();
+    return finalizationPromise;
+  };
+}
+
+function createIsolatedFinalizer({
+  agent,
+  manager,
+  clusterId,
+  state,
+  cleanup,
+  observerFinalizer,
+  onLine,
+  trackingCleanup,
+}) {
+  return ({ drainOutput = false } = {}) => {
+    if (state.finalizationPromise) return state.finalizationPromise;
+    state.taskExited = true;
+    state.finalizationPromise = (async () => {
+      if (state.tailProcess) {
+        try {
+          state.tailProcess.kill('SIGTERM');
+        } catch {
+          // Ignore - process may already be dead.
+        }
+        state.tailProcess = null;
+      }
+      if (state.statusCheckInterval) {
+        clearTimeout(state.statusCheckInterval);
+        state.statusCheckInterval = null;
+      }
+      try {
+        if (drainOutput) {
+          try {
+            await drainIsolatedLog({ manager, clusterId, state, onLine });
+          } catch (error) {
+            if (error?.finalDrainTimeout) throw error;
+            // A best-effort final read must not replace the provider result.
+          }
+        }
+        await observerFinalizer();
+      } finally {
+        cleanup();
+        if (agent._subagentTrackingCleanup === trackingCleanup) {
+          agent._subagentTrackingCleanup = null;
+        }
+        if (agent.currentTask === state.taskHandle) {
+          agent.currentTask = null;
+        }
+      }
+    })();
+    return state.finalizationPromise;
+  };
+}
+
+function createIsolatedSettler({ agent, taskId, providerName, state, finalize, resolve, reject }) {
+  return {
+    resolve: async (buildResult) => {
+      if (state.settled) return;
+      state.settled = true;
+      try {
+        await finalize({ drainOutput: true });
+        resolve(await buildResult());
+      } catch (error) {
+        const timeoutError =
+          error?.finalDrainTimeout || (state.deadlineAt && Date.now() >= state.deadlineAt);
+        reject(
+          timeoutError
+            ? new Error(`Task ${taskId} timeout after ${agent.timeout}ms (isolated mode)`)
+            : error
+        );
+      }
+    },
+    reject: async (error) => {
+      if (state.settled) return;
+      state.settled = true;
+      await finalize({ drainOutput: false });
+      reject(error);
+    },
+    cancel: async (reason = 'Task killed') => {
+      if (state.settled) return;
+      state.settled = true;
+      await finalize({ drainOutput: false });
+      agent._stopLivenessCheck?.();
+      resolve({
+        success: false,
+        output: state.fullOutput,
+        taskId,
+        error: reason,
+        tokenUsage: extractTokenUsage(state.fullOutput, providerName),
+      });
+    },
+  };
+}
+
 async function checkIsolatedStatus({
   agent,
   manager,
@@ -1735,75 +2197,80 @@ async function checkIsolatedStatus({
   taskId,
   providerName,
   state,
-  cleanup,
-  resolve,
-  onLine,
+  settler,
+  statusTimeoutMs,
 }) {
   if (state.taskExited) return;
 
-  const statusResult = await manager.execInContainer(clusterId, [
-    'sh',
-    '-c',
-    `zeroshot status ${taskId} 2>/dev/null || echo "not_found"`,
-  ]);
+  const statusResult = await manager.execInContainer(
+    clusterId,
+    ['sh', '-c', `zeroshot status ${taskId} 2>&1`],
+    { timeout: statusTimeoutMs }
+  );
 
-  const statusOutput = statusResult.stdout;
+  const statusOutput = [statusResult.stdout, statusResult.stderr].filter(Boolean).join('\n');
+  const isNotFound =
+    /\b(?:task|id)\s+not\s+found\b/i.test(statusOutput) || /\bnot_found\b/i.test(statusOutput);
+
+  if (statusResult.code !== 0 && !isNotFound) {
+    throw new Error(
+      `Isolated status command failed with code ${statusResult.code}: ${statusResult.stderr || statusResult.stdout || 'no output'}`
+    );
+  }
+
   const isSuccess = /Status:\s+completed/i.test(statusOutput);
   const isError = /Status:\s+failed/i.test(statusOutput);
-  const isNotFound = statusOutput.includes('not_found');
+  const isKilled = /Status:\s+killed/i.test(statusOutput);
+  const isStale = /Status:\s+stale/i.test(statusOutput);
 
-  if (!isSuccess && !isError && !isNotFound) {
+  if (!isSuccess && !isError && !isKilled && !isStale && !isNotFound) {
     return;
   }
 
-  state.taskExited = true;
-  await new Promise((r) => setTimeout(r, 200));
-
-  const finalReadResult = await manager.execInContainer(clusterId, [
-    'sh',
-    '-c',
-    `cat "${logFilePath}" 2>/dev/null || echo ""`,
-  ]);
-
-  if (finalReadResult.code === 0 && finalReadResult.stdout) {
-    state.fullOutput = finalReadResult.stdout;
-    const remainingLines = state.fullOutput.split('\n');
-    for (const line of remainingLines) {
-      if (line.trim()) {
-        onLine(line);
-      }
-    }
+  // A task record is created with pid=null before its watcher records the PID,
+  // so an empty stale result can be a startup race rather than task death.
+  if (isStale && !state.fullOutput) {
+    state.emptyStaleCount++;
+    if (state.emptyStaleCount === 1) return;
+  } else {
+    state.emptyStaleCount = 0;
   }
 
-  cleanup();
+  await new Promise((r) => setTimeout(r, 200));
+  await settler.resolve(async () => {
+    const success = isStale
+      ? determineStaleSuccess({ agent, output: state.fullOutput, providerName, taskId })
+      : isSuccess && !isError && !isKilled;
+    const errorContext = !success
+      ? extractErrorContext({
+          output: state.fullOutput,
+          taskId,
+          isNotFound,
+          debug: {
+            agentId: agent.id,
+            providerName,
+            pid: agent.processPid,
+            cwd: agent.config.cwd || process.cwd(),
+            worktreePath: agent.worktree?.path || null,
+            isolation: true,
+            clusterId,
+            logFilePath,
+          },
+        })
+      : null;
+    const parsedResult =
+      !success && !state.fullOutput.trim()
+        ? null
+        : await agent._parseResultOutput(state.fullOutput);
 
-  const success = isSuccess && !isError;
-  const errorContext = !success
-    ? extractErrorContext({
-        output: state.fullOutput,
-        taskId,
-        isNotFound,
-        debug: {
-          agentId: agent.id,
-          providerName,
-          pid: agent.processPid,
-          cwd: agent.config.cwd || process.cwd(),
-          worktreePath: agent.worktree?.path || null,
-          isolation: true,
-          clusterId,
-          logFilePath,
-        },
-      })
-    : null;
-  const parsedResult = await agent._parseResultOutput(state.fullOutput);
-
-  resolve({
-    success,
-    output: state.fullOutput,
-    taskId,
-    result: parsedResult,
-    error: errorContext,
-    tokenUsage: extractTokenUsage(state.fullOutput, providerName),
+    return {
+      success,
+      output: state.fullOutput,
+      taskId,
+      result: parsedResult,
+      error: errorContext,
+      tokenUsage: extractTokenUsage(state.fullOutput, providerName),
+    };
   });
 }
 
@@ -1815,29 +2282,57 @@ function startIsolatedStatusChecks({
   taskId,
   providerName,
   state,
-  cleanup,
-  resolve,
-  onLine,
+  settler,
+  statusIntervalMs,
+  maxStatusFailures,
 }) {
-  state.statusCheckInterval = setInterval(() => {
-    checkIsolatedStatus({
-      agent,
-      manager,
-      clusterId,
-      logFilePath,
-      taskId,
-      providerName,
-      state,
-      cleanup,
-      resolve,
-      onLine,
-    }).catch((statusErr) => {
-      agent._log(`[${agent.id}] Status check error (will retry): ${statusErr.message}`);
-    });
-  }, 2000);
+  const schedule = () => {
+    if (state.taskExited) return;
+    state.statusCheckInterval = setTimeout(async () => {
+      try {
+        await checkIsolatedStatus({
+          agent,
+          manager,
+          clusterId,
+          logFilePath,
+          taskId,
+          providerName,
+          state,
+          settler,
+          statusTimeoutMs: statusIntervalMs,
+        });
+        state.statusFailureCount = 0;
+      } catch (statusErr) {
+        state.statusFailureCount++;
+        if (state.statusFailureCount >= maxStatusFailures) {
+          await settler.reject(
+            new Error(
+              `Isolated status check failed ${state.statusFailureCount} consecutive times for task ${taskId}: ${statusErr.message}`
+            )
+          );
+          return;
+        }
+        agent._log(`[${agent.id}] Status check error (will retry): ${statusErr.message}`);
+      }
+      schedule();
+    }, statusIntervalMs);
+  };
+  schedule();
 }
 
-function followClaudeTaskLogsIsolated(agent, taskId) {
+function installIsolatedTimeout({ agent, taskId, state, settler }) {
+  if (agent.timeout > 0) {
+    state.deadlineAt = Date.now() + agent.timeout;
+    state.timeoutHandle = setTimeout(() => {
+      if (state.taskExited) return;
+      settler
+        .reject(new Error(`Task ${taskId} timeout after ${agent.timeout}ms (isolated mode)`))
+        .catch(() => {});
+    }, agent.timeout);
+  }
+}
+
+function followClaudeTaskLogsIsolated(agent, taskId, options = {}) {
   const { isolation } = agent;
   if (!isolation?.manager) {
     throw new Error('followClaudeTaskLogsIsolated: isolation manager not found');
@@ -1846,27 +2341,77 @@ function followClaudeTaskLogsIsolated(agent, taskId) {
   const manager = isolation.manager;
   const clusterId = isolation.clusterId;
   const providerName = agent._resolveProvider ? agent._resolveProvider() : 'claude';
+  const observerFactory = options.observerFactory || createCodexSubagentObserver;
+  const statusIntervalMs = options.statusIntervalMs || 2000;
+  const maxStatusFailures = options.maxStatusFailures ?? 3;
 
   return new Promise((resolve, reject) => {
     const state = createIsolatedLogState();
     const cleanup = buildIsolatedCleanup(state);
-    const onLine = (line) => broadcastIsolatedLine({ agent, providerName, taskId, line });
+    const observer = createCodexObserverForFollower(
+      agent,
+      providerName,
+      clusterId,
+      observerFactory
+    );
+    const onLine = (line) => broadcastIsolatedLine({ agent, providerName, taskId, line, observer });
+    const observerFinalizer = createIsolatedObserverFinalizer({ state, observer });
+    const trackingCleanup = () => {
+      observerFinalizer().catch(() => {});
+    };
+    if (observer) {
+      agent._subagentTrackingCleanup = trackingCleanup;
+    }
+    const finalize = createIsolatedFinalizer({
+      agent,
+      manager,
+      clusterId,
+      state,
+      cleanup,
+      observerFinalizer,
+      onLine,
+      trackingCleanup,
+    });
+    const settler = createIsolatedSettler({
+      agent,
+      taskId,
+      providerName,
+      state,
+      finalize,
+      resolve,
+      reject,
+    });
+    state.taskHandle = {
+      kill: (reason) => settler.cancel(reason),
+    };
+    agent.currentTask = state.taskHandle;
+    installIsolatedTimeout({ agent, taskId, state, settler });
 
-    manager
-      .execInContainer(clusterId, ['sh', '-c', `zeroshot get-log-path ${taskId}`])
-      .then(({ stdout, stderr, code }) => {
+    Promise.resolve()
+      .then(() => {
+        if (state.taskExited) return null;
+        return manager.execInContainer(clusterId, ['sh', '-c', `zeroshot get-log-path ${taskId}`]);
+      })
+      .then((logPathResult) => {
+        if (state.taskExited) return;
+        const { stdout, stderr, code } = logPathResult;
         if (code !== 0) {
-          cleanup();
-          return reject(
-            new Error(`Failed to get log path for ${taskId} inside container: ${stderr || stdout}`)
-          );
+          settler
+            .reject(
+              new Error(
+                `Failed to get log path for ${taskId} inside container: ${stderr || stdout}`
+              )
+            )
+            .catch(() => {});
+          return;
         }
 
         const logFilePath = stdout.trim();
         if (!logFilePath) {
-          cleanup();
-          return reject(new Error(`Empty log path returned for ${taskId}`));
+          settler.reject(new Error(`Empty log path returned for ${taskId}`)).catch(() => {});
+          return;
         }
+        state.logFilePath = logFilePath;
 
         agent._log(`[${agent.id}] Following isolated task logs (streaming): ${logFilePath}`);
 
@@ -1887,23 +2432,13 @@ function followClaudeTaskLogsIsolated(agent, taskId) {
           taskId,
           providerName,
           state,
-          cleanup,
-          resolve,
-          onLine,
+          settler,
+          statusIntervalMs,
+          maxStatusFailures,
         });
-
-        if (agent.timeout > 0) {
-          setTimeout(() => {
-            if (!state.taskExited) {
-              cleanup();
-              reject(new Error(`Task ${taskId} timeout after ${agent.timeout}ms (isolated mode)`));
-            }
-          }, agent.timeout);
-        }
       })
       .catch((err) => {
-        cleanup();
-        reject(err);
+        settler.reject(err).catch(() => {});
       });
   });
 }
@@ -2036,44 +2571,110 @@ async function parseResultOutput(agent, output) {
   return parsed;
 }
 
+function settleTaskKillWithin(operation, taskId, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeoutHandle = null;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutHandle);
+      callback(value);
+    };
+    timeoutHandle = setTimeout(
+      () => finish(reject, new Error(`Timed out terminating task ${taskId}`)),
+      timeoutMs
+    );
+
+    Promise.resolve(operation).then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error)
+    );
+  });
+}
+
 /**
  * Kill current task
  * @param {Object} agent - Agent instance
+ * @returns {Promise<void>}
  */
-function killTask(agent) {
+async function killTask(agent) {
+  const taskId = agent.currentTaskId;
+
+  const cleanupSubagentTracking = agent._subagentTrackingCleanup;
+  agent._subagentTrackingCleanup = null;
+  try {
+    cleanupSubagentTracking?.();
+  } catch {
+    // Optional tracking cleanup must never change kill behavior.
+  }
+
   if (agent.currentTask) {
     // currentTask may be either a ChildProcess or our custom { kill } object
     if (typeof agent.currentTask.kill === 'function') {
-      agent.currentTask.kill('SIGTERM');
+      try {
+        await agent.currentTask.kill('SIGTERM');
+      } catch (error) {
+        agent._log(`Note: Could not settle task ${taskId || 'UNKNOWN'}: ${error.message}`);
+      }
     }
     agent.currentTask = null;
   }
 
   // Also kill the underlying zeroshot task if we have a task ID
   // This ensures the task process is stopped, not just our polling intervals
-  if (agent.currentTaskId) {
-    const ctPath = getClaudeTasksPath();
-    runCommandWithTimeout(
-      ctPath,
-      ['task', 'kill', agent.currentTaskId],
-      { timeout: 10000 },
-      (error) => {
-        if (error) {
-          // Task may have already completed or been killed, ignore errors
-          agent._log(`Note: Could not kill task ${agent.currentTaskId}: ${error.message}`);
-        } else {
-          agent._log(`Killed task ${agent.currentTaskId}`);
-        }
+  if (!taskId) return;
+
+  if (agent.isolation?.manager) {
+    try {
+      const result = await settleTaskKillWithin(
+        agent.isolation.manager.execInContainer(
+          agent.isolation.clusterId,
+          ['zeroshot', 'kill', taskId],
+          { timeout: 8000 }
+        ),
+        taskId
+      );
+      if (result.code !== 0) {
+        throw new Error(result.stderr || result.stdout || `exit code ${result.code}`);
       }
+      if (agent.currentTaskId === taskId) agent.currentTaskId = null;
+      agent._log(`Killed isolated task ${taskId}`);
+    } catch (error) {
+      agent._log(`Note: Could not kill isolated task ${taskId}: ${error.message}`);
+      throw error;
+    }
+    return;
+  }
+
+  const ctPath = getClaudeTasksPath();
+  try {
+    await settleTaskKillWithin(
+      new Promise((resolve, reject) => {
+        runCommandWithTimeout(ctPath, ['kill', taskId], { timeout: 8000 }, (error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      }),
+      taskId
     );
-    agent.currentTaskId = null;
+    if (agent.currentTaskId === taskId) agent.currentTaskId = null;
+    agent._log(`Killed task ${taskId}`);
+  } catch (error) {
+    // Retain the ID so callers can diagnose or retry the failed termination.
+    agent._log(`Note: Could not kill task ${taskId}: ${error.message}`);
+    throw error;
   }
 }
 
 module.exports = {
   ensureAskUserQuestionHook,
+  ensureDangerousGitHook,
+  ensureSubagentTrackingHook,
   spawnClaudeTask,
+  createLogFollower,
   followClaudeTaskLogs,
+  followClaudeTaskLogsIsolated,
   waitForTaskReady,
   spawnClaudeTaskIsolated,
   getClaudeTasksPath,
@@ -2084,4 +2685,5 @@ module.exports = {
   killTask,
   // Exported for testing
   handleStatusCompletion,
+  buildSpawnEnv,
 };

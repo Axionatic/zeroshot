@@ -3,16 +3,17 @@
  */
 
 const IsolationManager = require('../../src/isolation-manager');
-const { execSync } = require('child_process');
+const assert = require('assert');
+const { execFileSync, execSync } = require('child_process');
 
 describe('Docker Image Build with Retry', function () {
   // Docker builds can be slow
-  this.timeout(120000);
+  this.timeout(20 * 60 * 1000);
 
   const TEST_IMAGE = 'zeroshot-cluster-base-test';
 
   // Skip Docker tests in CI (no Docker image available)
-  // To run locally: docker build -t zeroshot-cluster-base docker/zeroshot-cluster/
+  // To run locally: docker build -t zeroshot-cluster-base -f docker/zeroshot-cluster/Dockerfile .
   before(function () {
     // Opt-in only: building images is slow and environment-dependent.
     if (process.env.ZEROSHOT_DOCKER_IMAGE_TESTS !== '1') {
@@ -110,6 +111,23 @@ describe('Docker Image Build with Retry', function () {
     }
   });
 
+  it('should build native dependencies for the image Node ABI', async function () {
+    await IsolationManager.ensureImage(TEST_IMAGE, true);
+
+    execFileSync(
+      'docker',
+      [
+        'run',
+        '--rm',
+        TEST_IMAGE,
+        'node',
+        '-e',
+        'const Database = require("/tmp/zeroshot/node_modules/better-sqlite3"); new Database(":memory:").close();',
+      ],
+      { stdio: 'pipe' }
+    );
+  });
+
   it('should throw error when autoBuild is false and image missing', async function () {
     const MISSING_IMAGE = 'this-image-does-not-exist';
 
@@ -117,9 +135,11 @@ describe('Docker Image Build with Retry', function () {
       await IsolationManager.ensureImage(MISSING_IMAGE, false);
       throw new Error('Should have thrown error');
     } catch (err) {
-      if (!err.message.includes('not found')) {
-        throw new Error(`Expected 'not found' error, got: ${err.message}`);
-      }
+      assert.match(err.message, /not found/);
+      assert.match(
+        err.message,
+        /docker build -t this-image-does-not-exist -f docker\/zeroshot-cluster\/Dockerfile \./
+      );
     }
   });
 });

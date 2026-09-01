@@ -1,6 +1,22 @@
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
+const { getSubagentEventsDir } = require('./subagent-events');
+const MAX_EVENT_READ_BYTES = 1024 * 1024;
+const MAX_ACTIVE_SUBAGENTS = 100;
+const MAX_LABEL_LENGTH = 80;
+const MAX_SUBAGENT_ID_LENGTH = 128;
+
+function normalizeLabel(value) {
+  const printable = Array.from(value)
+    .filter((character) => {
+      const codePoint = character.codePointAt(0);
+      return codePoint > 31 && !(codePoint >= 127 && codePoint <= 159);
+    })
+    .join('')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return Array.from(printable).slice(0, MAX_LABEL_LENGTH).join('');
+}
 
 class SubagentTracker {
   /**
@@ -11,7 +27,7 @@ class SubagentTracker {
    * @param {string} clusterId - Cluster ID to track
    */
   constructor(clusterId) {
-    this.baseDir = path.join(os.tmpdir(), 'zeroshot-subagents', clusterId);
+    this.baseDir = getSubagentEventsDir(clusterId);
     // agentId -> [{id, description, startedAt}]
     this.active = new Map();
     // filePath -> byte offset (avoids re-reading entire file each poll)
@@ -55,10 +71,11 @@ class SubagentTracker {
     const offset = this.offsets.get(filePath) || 0;
     if (stat.size <= offset) return; // No new data
 
+    const readLength = Math.min(stat.size - offset, MAX_EVENT_READ_BYTES);
     let chunk;
     try {
       const fd = fs.openSync(filePath, 'r');
-      const buf = Buffer.alloc(stat.size - offset);
+      const buf = Buffer.alloc(readLength);
       fs.readSync(fd, buf, 0, buf.length, offset);
       fs.closeSync(fd);
       chunk = buf.toString('utf8');
@@ -66,9 +83,18 @@ class SubagentTracker {
       return;
     }
 
-    this.offsets.set(filePath, stat.size);
+    const finalNewline = chunk.lastIndexOf('\n');
+    if (finalNewline === -1) {
+      if (readLength === MAX_EVENT_READ_BYTES) {
+        this.offsets.set(filePath, offset + readLength);
+      }
+      return; // Wait for a complete record, or discard one that exceeds the byte bound.
+    }
 
-    for (const line of chunk.split('\n')) {
+    const completeChunk = chunk.slice(0, finalNewline + 1);
+    this.offsets.set(filePath, offset + Buffer.byteLength(completeChunk, 'utf8'));
+
+    for (const line of completeChunk.split('\n')) {
       if (!line.trim()) continue;
       let event;
       try {
@@ -87,15 +113,34 @@ class SubagentTracker {
    * @private
    */
   _processEvent(agentId, event) {
+    if (
+      !event ||
+      typeof event !== 'object' ||
+      Array.isArray(event) ||
+      (event.event !== 'start' && event.event !== 'stop') ||
+      typeof event.agent_id !== 'string' ||
+      !event.agent_id.trim() ||
+      event.agent_id.length > MAX_SUBAGENT_ID_LENGTH ||
+      typeof event.ts !== 'number' ||
+      !Number.isFinite(event.ts) ||
+      (event.description !== undefined && typeof event.description !== 'string') ||
+      (event.agent_type !== undefined && typeof event.agent_type !== 'string')
+    ) {
+      return;
+    }
+
     if (!this.active.has(agentId)) {
       this.active.set(agentId, []);
     }
     const list = this.active.get(agentId);
 
     if (event.event === 'start') {
+      if (list.some((subagent) => subagent.id === event.agent_id)) return;
+      if (list.length >= MAX_ACTIVE_SUBAGENTS) return;
       list.push({
         id: event.agent_id,
-        description: event.description || event.agent_type || 'subagent',
+        description:
+          normalizeLabel(event.description || event.agent_type || 'subagent') || 'subagent',
         startedAt: event.ts,
       });
     } else if (event.event === 'stop') {

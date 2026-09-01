@@ -349,8 +349,8 @@ class AgentWrapper {
   /**
    * Stop the agent
    */
-  stop() {
-    return lifecycleStop(this);
+  stop(options) {
+    return lifecycleStop(this, options);
   }
 
   /**
@@ -558,8 +558,19 @@ class AgentWrapper {
       },
     };
 
-    // Execute the task with resume context
-    await this._executeTask(triggeringMessage);
+    if (this._currentExecution) {
+      throw new Error(`Agent ${this.id} execution is still pending`);
+    }
+
+    const executionPromise = this._executeTask(triggeringMessage);
+    this._currentExecution = executionPromise;
+    try {
+      await executionPromise;
+    } finally {
+      if (this._currentExecution === executionPromise) {
+        this._currentExecution = null;
+      }
+    }
   }
 
   /**

@@ -28,7 +28,6 @@ const { findPlatformMismatchReason } = require('./validation-platform');
 const safeExec = require('../lib/safe-exec');
 const path = require('path');
 const { calculateRateLimitDelay, isRateLimitError } = require('./rate-limit-backoff');
-const { killTask } = require('./agent-task-executor');
 
 const DEFAULT_VALIDATOR_IMAGE = 'zeroshot-cluster-base';
 
@@ -168,6 +167,9 @@ function start(agent) {
   if (agent.running) {
     throw new Error(`Agent ${agent.id} is already running`);
   }
+  if (agent._currentExecution) {
+    throw new Error(`Agent ${agent.id} execution is still pending`);
+  }
 
   agent.running = true;
   agent.state = 'idle';
@@ -200,10 +202,16 @@ function start(agent) {
  * Stop the agent
  * Waits for any in-flight execution to complete before returning.
  * @param {AgentWrapper} agent - Agent instance
+ * @param {Object} [options] - Shutdown behavior
+ * @param {boolean} [options.requireTaskTermination=false] - Reject unless task kill completes
+ * @param {number} [options.shutdownTimeoutMs=5000] - Total wait budget for kill and execution
  * @returns {Promise<void>}
  */
-async function stop(agent) {
-  if (!agent.running) {
+async function stop(agent, { requireTaskTermination = false, shutdownTimeoutMs = 5000 } = {}) {
+  const shutdownDeadline = Date.now() + shutdownTimeoutMs;
+  const hasTrackedTask = !!(agent.currentTask || agent.currentTaskId);
+  const hasPendingExecution = !!agent._currentExecution;
+  if (!agent.running && !(requireTaskTermination && (hasTrackedTask || hasPendingExecution))) {
     return;
   }
 
@@ -215,26 +223,86 @@ async function stop(agent) {
     agent.unsubscribe = null;
   }
 
-  // Kill current task if any
-  if (agent.currentTask) {
-    agent._killTask();
+  const pendingShutdown = [];
+  let killError = null;
+  let killFinished = !hasTrackedTask;
+
+  // Kill current task if any, within the same bound as in-flight execution.
+  if (hasTrackedTask) {
+    pendingShutdown.push(
+      Promise.resolve()
+        .then(() => agent._killTask())
+        .catch((error) => {
+          killError = error;
+        })
+        .finally(() => {
+          killFinished = true;
+        })
+    );
   }
 
-  // Wait for in-flight execution to complete (up to 5 seconds)
-  // This prevents write-after-close race conditions
+  // Wait for kill and in-flight execution together. This prevents
+  // write-after-close races without extending the established stop bound.
   if (agent._currentExecution) {
-    try {
+    pendingShutdown.push(Promise.resolve(agent._currentExecution));
+  }
+
+  let shutdownTimedOut = false;
+  if (pendingShutdown.length > 0) {
+    let timeoutHandle;
+    await Promise.race([
+      Promise.allSettled(pendingShutdown),
+      new Promise((resolve) => {
+        timeoutHandle = setTimeout(() => {
+          shutdownTimedOut = true;
+          resolve();
+        }, shutdownTimeoutMs);
+      }),
+    ]);
+    clearTimeout(timeoutHandle);
+  }
+
+  // A task can be registered while the in-flight execution is winding down.
+  // Strict shutdown must observe and terminate that late task before succeeding.
+  if (
+    requireTaskTermination &&
+    !killError &&
+    !shutdownTimedOut &&
+    (agent.currentTask || agent.currentTaskId)
+  ) {
+    const remainingMs = shutdownDeadline - Date.now();
+    if (remainingMs <= 0) {
+      shutdownTimedOut = true;
+    } else {
+      let timeoutHandle;
       await Promise.race([
-        agent._currentExecution,
-        new Promise((resolve) => setTimeout(resolve, 5000)),
+        Promise.resolve()
+          .then(() => agent._killTask())
+          .catch((error) => {
+            killError = error;
+          })
+          .finally(() => {
+            killFinished = true;
+          }),
+        new Promise((resolve) => {
+          timeoutHandle = setTimeout(() => {
+            shutdownTimedOut = true;
+            resolve();
+          }, remainingMs);
+        }),
       ]);
-    } catch {
-      // Ignore errors from cancelled execution
+      clearTimeout(timeoutHandle);
     }
-    agent._currentExecution = null;
   }
 
   agent._log(`Agent ${agent.id} stopped`);
+
+  if (requireTaskTermination) {
+    if (killError) throw killError;
+    if (!killFinished || shutdownTimedOut) {
+      throw new Error(`Timed out terminating task for agent ${agent.id}`);
+    }
+  }
 }
 
 /**
@@ -638,6 +706,8 @@ async function runTaskAttempt(agent, triggeringMessage) {
     orchestrator: agent.orchestrator,
   });
 
+  if (!agent.running) return;
+
   // Build context
   agent.state = 'building_context';
   const context = agent._buildContext(triggeringMessage);
@@ -648,6 +718,7 @@ async function runTaskAttempt(agent, triggeringMessage) {
   // Spawn provider task
   agent.state = 'executing_task';
   await applyValidatorJitter(agent);
+  if (!agent.running) return;
   publishTaskStarted(agent, triggeringMessage);
 
   const result = await agent._spawnClaudeTask(context);
@@ -771,6 +842,23 @@ ${'='.repeat(80)}`);
     });
   }
 
+  if (error?.terminationFailure) {
+    agent._publish({
+      topic: 'CLUSTER_FAILED',
+      receiver: 'broadcast',
+      content: {
+        text: `Cluster failed: task cleanup failed for ${agent.id} - ${error.message}`,
+        data: {
+          reason: 'task_termination_failed',
+          agentId: agent.id,
+          role: agent.role,
+          taskId: agent.currentTaskId,
+          error: error.message,
+        },
+      },
+    });
+  }
+
   // Save failure info to cluster for resume capability
   agent.cluster.failureInfo = {
     agentId: agent.id,
@@ -824,7 +912,9 @@ ${'='.repeat(80)}`);
     orchestrator: agent.orchestrator,
   });
 
-  agent.state = 'idle';
+  if (!error?.terminationFailure) {
+    agent.state = 'idle';
+  }
 }
 
 async function scheduleRetry(agent, error, attempt, maxRetries, _baseDelay) {
@@ -965,7 +1055,17 @@ async function executeTask(agent, triggeringMessage) {
       sigtermRetryGranted = updated.sigtermRetryGranted;
       noMessagesRetryGranted = updated.noMessagesRetryGranted;
       // Kill orphan task before retry — prevents accumulating zombie processes
-      killTask(agent);
+      try {
+        await agent._killTask();
+      } catch (killError) {
+        const terminationError = new Error(
+          `Task attempt failed and cleanup could not terminate it: ${killError.message}`
+        );
+        terminationError.cause = killError;
+        terminationError.terminationFailure = true;
+        await handleFinalFailure(agent, triggeringMessage, terminationError, attempt);
+        return;
+      }
       agent.processPid = null;
 
       const shouldStop = await handleTaskAttemptFailure({

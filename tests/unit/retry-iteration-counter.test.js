@@ -76,6 +76,26 @@ describe('Retry does not increment iteration counter', function () {
     await worker.stop();
   });
 
+  it('reports a normal final failure when retry cleanup cannot terminate the task', async function () {
+    const worker = createWorker();
+    mockRunner.when('worker').failsOnCall(1, 'provider failed').thenReturns({ ok: true });
+    worker._killTask = () => Promise.reject(new Error('termination failed'));
+    worker.start();
+
+    await worker._executeTask(trigger);
+
+    mockRunner.assertCalled('worker', 1);
+    assert.match(cluster.failureInfo.error, /termination failed/);
+    assert.strictEqual(worker.state, 'error');
+    const [clusterFailure] = messageBus.query({
+      cluster_id: cluster.id,
+      topic: 'CLUSTER_FAILED',
+    });
+    assert.strictEqual(clusterFailure.content.data.reason, 'task_termination_failed');
+
+    await worker.stop();
+  });
+
   it('increments iteration to 2 after two successful trigger fires', async function () {
     const worker = createWorker();
     mockRunner.when('worker').returns({ ok: true });

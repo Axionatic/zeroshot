@@ -12,13 +12,22 @@
  */
 
 const assert = require('assert');
+const { EventEmitter } = require('events');
+const fs = require('fs');
+const {
+  getSubagentEventsDir,
+  getSubagentEventsFile,
+  prepareSharedSubagentEventsFile,
+} = require('../../src/subagent-events');
+const { SubagentTracker } = require('../../src/subagent-tracker');
+const { runCodexSmoke, runSmoke } = require('../../scripts/smoke-codex-subagents');
 const IsolationManager = require('../../src/isolation-manager');
 
 describe('IsolationManager', function () {
   this.timeout(60000); // Docker operations can be slow
 
   // Skip Docker tests in CI (no Docker image available)
-  // To run locally: docker build -t zeroshot-cluster-base docker/zeroshot-cluster/
+  // To run locally: docker build -t zeroshot-cluster-base -f docker/zeroshot-cluster/Dockerfile .
   before(function () {
     if (process.env.CI) {
       this.skip();
@@ -81,6 +90,7 @@ describe('IsolationManager', function () {
       } catch {
         // Ignore cleanup errors
       }
+      fs.rmSync(getSubagentEventsDir(testClusterId), { recursive: true, force: true });
     });
 
     it('createContainer() creates a running container', async function () {
@@ -177,6 +187,39 @@ describe('IsolationManager', function () {
 
       assert(output.includes('test input'), 'Should echo back input');
     });
+
+    it('shares container-written subagent events with the host tracker', async function () {
+      const parentAgentId = 'container-parent';
+      const event = {
+        event: 'start',
+        agent_id: 'container-child',
+        description: 'Written inside Docker',
+        ts: 123,
+      };
+      const eventsFile = getSubagentEventsFile(testClusterId, parentAgentId);
+
+      await manager.createContainer(testClusterId, {
+        workDir: process.cwd(),
+        image: 'alpine:latest',
+      });
+      assert.strictEqual(prepareSharedSubagentEventsFile(eventsFile), true);
+
+      const result = await manager.execInContainer(testClusterId, [
+        'sh',
+        '-c',
+        `adduser -D -u 1000 telemetry && su telemetry -s /bin/sh -c 'printf "%s\\n" "$1" >> "$2"' telemetry-event-write "$1" "$2"`,
+        'telemetry-event-write',
+        JSON.stringify(event),
+        eventsFile,
+      ]);
+      assert.strictEqual(result.code, 0, result.stderr);
+
+      const tracker = new SubagentTracker(testClusterId);
+      tracker.poll();
+      assert.deepStrictEqual(tracker.getActiveSubagents(parentAgentId), [
+        { id: 'container-child', description: 'Written inside Docker', startedAt: 123 },
+      ]);
+    });
   });
 
   describe('Error Handling', function () {
@@ -201,5 +244,120 @@ describe('IsolationManager', function () {
         assert(err.message.includes('No container found'));
       }
     });
+  });
+});
+
+describe('Codex subagent smoke script', function () {
+  it('does not invoke Codex until explicitly activated', async function () {
+    const output = [];
+    await runSmoke({
+      env: {},
+      log: (line) => output.push(line),
+      getVersion: () => {
+        throw new Error('Codex version should not be read before activation');
+      },
+      runProvider: () => {
+        throw new Error('Codex provider should not run before activation');
+      },
+    });
+
+    assert.match(output.join('\n'), /CODEX_SUBAGENT_SMOKE=1/);
+    assert.match(output.join('\n'), /provider invocation was not run/i);
+  });
+
+  it('escalates and detaches an activated provider child that ignores the timeout signal', async function () {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    const signals = [];
+    let unrefCount = 0;
+    child.kill = (signal) => {
+      signals.push(signal);
+      return true;
+    };
+    child.unref = () => {
+      unrefCount++;
+    };
+
+    const result = await runCodexSmoke({
+      eventsFile: '/tmp/not-used-by-provider-runner.jsonl',
+      onLine: () => {},
+      timeoutMs: 5,
+      killGraceMs: 5,
+      spawnProcess: () => child,
+    });
+
+    assert.deepStrictEqual(signals, ['SIGTERM', 'SIGKILL']);
+    assert.strictEqual(unrefCount, 1);
+    assert.strictEqual(result.code, 124);
+    assert.strictEqual(result.timedOut, true);
+    assert.match(result.stderr, /timed out after 5ms/i);
+  });
+
+  it('detaches when the provider child throws while being terminated', async function () {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    let stderrDestroyCount = 0;
+    let unrefCount = 0;
+    child.stdout.destroy = () => {
+      throw new Error('stdout destroy unavailable');
+    };
+    child.stderr.destroy = () => {
+      stderrDestroyCount++;
+    };
+    child.kill = () => {
+      throw new Error('kill unavailable');
+    };
+    child.unref = () => {
+      unrefCount++;
+    };
+
+    const result = await runCodexSmoke({
+      eventsFile: '/tmp/not-used-by-provider-runner.jsonl',
+      onLine: () => {},
+      timeoutMs: 5,
+      killGraceMs: 5,
+      spawnProcess: () => child,
+    });
+
+    assert.strictEqual(result.code, 124);
+    assert.strictEqual(stderrDestroyCount, 1);
+    assert.strictEqual(unrefCount, 1);
+  });
+
+  it('detaches when signalling the timed-out provider emits an error', async function () {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    let stdoutDestroyCount = 0;
+    let stderrDestroyCount = 0;
+    let unrefCount = 0;
+    child.stdout.destroy = () => {
+      stdoutDestroyCount++;
+    };
+    child.stderr.destroy = () => {
+      stderrDestroyCount++;
+    };
+    child.kill = () => {
+      child.emit('error', Object.assign(new Error('operation not permitted'), { code: 'EPERM' }));
+      return false;
+    };
+    child.unref = () => {
+      unrefCount++;
+    };
+
+    const result = await runCodexSmoke({
+      eventsFile: '/tmp/not-used-by-provider-runner.jsonl',
+      onLine: () => {},
+      timeoutMs: 5,
+      killGraceMs: 50,
+      spawnProcess: () => child,
+    });
+
+    assert.strictEqual(result.code, 124);
+    assert.strictEqual(stdoutDestroyCount, 1);
+    assert.strictEqual(stderrDestroyCount, 1);
+    assert.strictEqual(unrefCount, 1);
   });
 });

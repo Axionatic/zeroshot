@@ -20,8 +20,10 @@ const { normalizeProviderName } = require('../lib/provider-names');
 const { resolveMounts, resolveEnvs, expandEnvPatterns } = require('../lib/docker-config');
 const { getProvider } = require('./providers');
 const { readRepoSettings } = require('../lib/repo-settings');
+const { getSubagentEventsDir } = require('./subagent-events');
 
 const DEFAULT_WORKTREE_SETUP_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_DOCKER_BUILD_TIMEOUT_MS = 15 * 60 * 1000;
 
 function runSync(command, args, options = {}) {
   const timeout = options.timeout ?? 30000;
@@ -163,11 +165,24 @@ class IsolationManager {
     const clusterConfigDir = this._createClusterConfigDir(clusterId, containerHome);
     console.log(`[IsolationManager] Created cluster config dir at ${clusterConfigDir}`);
 
+    const subagentEventsPath = getSubagentEventsDir(clusterId);
+    let subagentEventsDir = null;
+    try {
+      fs.mkdirSync(subagentEventsPath, { recursive: true, mode: 0o711 });
+      fs.chmodSync(subagentEventsPath, 0o711);
+      subagentEventsDir = subagentEventsPath;
+    } catch (error) {
+      console.warn(
+        `[IsolationManager] Could not prepare subagent tracking directory: ${error.message}`
+      );
+    }
+
     const args = this._buildBaseDockerArgs({
       containerName,
       workDir,
       containerHome,
       clusterConfigDir,
+      subagentEventsDir,
     });
 
     const mountedHosts = this._applyCredentialMounts(args, config, settings, containerHome);
@@ -250,8 +265,14 @@ class IsolationManager {
     return isolatedDir;
   }
 
-  _buildBaseDockerArgs({ containerName, workDir, containerHome, clusterConfigDir }) {
-    return [
+  _buildBaseDockerArgs({
+    containerName,
+    workDir,
+    containerHome,
+    clusterConfigDir,
+    subagentEventsDir = null,
+  }) {
+    const args = [
       'run',
       '-d',
       '--name',
@@ -265,6 +286,10 @@ class IsolationManager {
       '-v',
       `${clusterConfigDir}:${containerHome}/.claude`,
     ];
+    if (subagentEventsDir) {
+      args.push('-v', `${subagentEventsDir}:${subagentEventsDir}`);
+    }
+    return args;
   }
 
   _resolveMountConfig(config, settings) {
@@ -1043,11 +1068,31 @@ class IsolationManager {
     }
 
     // Copy hook script to block AskUserQuestion (CRITICAL for autonomous execution)
-    const hookScriptSrc = path.join(__dirname, '..', 'hooks', 'block-ask-user-question.py');
+    const hookScriptSrc = path.join(__dirname, '..', 'cluster-hooks', 'block-ask-user-question.py');
     const hookScriptDst = path.join(hooksDir, 'block-ask-user-question.py');
-    if (fs.existsSync(hookScriptSrc)) {
-      fs.copyFileSync(hookScriptSrc, hookScriptDst);
-      fs.chmodSync(hookScriptDst, 0o755);
+    if (!fs.existsSync(hookScriptSrc)) {
+      throw new Error(
+        `Cannot isolate cluster ${clusterId}: hook script missing at ${hookScriptSrc}. ` +
+          'Without it agents can block on AskUserQuestion forever. ' +
+          'Check that cluster-hooks/ is listed in package.json "files".'
+      );
+    }
+    fs.copyFileSync(hookScriptSrc, hookScriptDst);
+    fs.chmodSync(hookScriptDst, 0o755);
+
+    const subagentHookScriptSrc = path.join(__dirname, '..', 'cluster-hooks', 'track-subagents.py');
+    const subagentHookScriptDst = path.join(hooksDir, 'track-subagents.py');
+    let hasSubagentHook = false;
+    try {
+      if (fs.existsSync(subagentHookScriptSrc)) {
+        fs.copyFileSync(subagentHookScriptSrc, subagentHookScriptDst);
+        fs.chmodSync(subagentHookScriptDst, 0o755);
+        hasSubagentHook = true;
+      }
+    } catch (error) {
+      console.warn(
+        `[IsolationManager] Could not install optional subagent tracking hook: ${error.message}`
+      );
     }
 
     // Create settings.json with PreToolUse hook to block AskUserQuestion
@@ -1067,6 +1112,18 @@ class IsolationManager {
         ],
       },
     };
+    if (hasSubagentHook) {
+      const subagentHook = {
+        hooks: [
+          {
+            type: 'command',
+            command: `${containerHome}/.claude/hooks/track-subagents.py`,
+          },
+        ],
+      };
+      clusterSettings.hooks.SubagentStart = [subagentHook];
+      clusterSettings.hooks.SubagentStop = [subagentHook];
+    }
     fs.writeFileSync(
       path.join(configDir, 'settings.json'),
       JSON.stringify(clusterSettings, null, 2)
@@ -1258,6 +1315,7 @@ class IsolationManager {
           cwd: repoRoot,
           encoding: 'utf8',
           stdio: 'inherit',
+          timeout: DEFAULT_DOCKER_BUILD_TIMEOUT_MS,
         });
 
         console.log(`[IsolationManager] ✓ Image '${image}' built successfully`);
@@ -1293,7 +1351,7 @@ class IsolationManager {
     if (!autoBuild) {
       throw new Error(
         `Docker image '${image}' not found. Build it with:\n` +
-          `  docker build -t ${image} zeroshot/cluster/docker/zeroshot-cluster/`
+          `  docker build -t ${image} -f docker/zeroshot-cluster/Dockerfile .`
       );
     }
 

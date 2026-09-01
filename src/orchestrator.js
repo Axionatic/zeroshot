@@ -54,6 +54,7 @@ const { loadSettings } = require('../lib/settings');
 const { normalizeProviderName } = require('../lib/provider-names');
 const { getProvider } = require('./providers');
 const StateSnapshotter = require('./state-snapshotter');
+const { getSubagentEventsDir } = require('./subagent-events');
 const { resolveClusterRequiredQualityGates } = require('./quality-gates');
 const {
   commandProofsToQualityGates,
@@ -512,6 +513,8 @@ class Orchestrator {
     if (!requestedClusterId) {
       return this._generateUniqueClusterId(null, dbPath || null);
     }
+
+    getSubagentEventsDir(requestedClusterId);
 
     const existingCluster = this.clusters.get(requestedClusterId);
     const candidateDbPath = dbPath || path.join(this.storageDir, `${requestedClusterId}.db`);
@@ -2343,8 +2346,8 @@ class Orchestrator {
    * @private
    */
   _cleanupSubagentEvents(clusterId) {
+    const dir = getSubagentEventsDir(clusterId);
     try {
-      const dir = path.join(os.tmpdir(), 'zeroshot-subagents', clusterId);
       fs.rmSync(dir, { recursive: true, force: true });
     } catch {
       // Already gone or never created
@@ -2968,7 +2971,7 @@ class Orchestrator {
 
     // Kill current task
     try {
-      agent._killTask();
+      await agent._killTask();
     } catch (err) {
       this._log(`⚠️  Failed to kill agent ${agentId} task:`, err.message);
     }
@@ -3403,7 +3406,7 @@ Continue from where you left off. Review your previous output to understand what
         // This prevents the old instance from draining buffered messages or
         // finishing in-flight work after the new agent has already started.
         if (existingAgent.stop) {
-          await existingAgent.stop();
+          await existingAgent.stop({ requireTaskTermination: true });
         }
 
         // Remove from cluster.agents array
@@ -3475,7 +3478,7 @@ Continue from where you left off. Review your previous output to understand what
       }
 
       const agent = cluster.agents[agentIndex];
-      await agent.stop();
+      await agent.stop({ requireTaskTermination: true });
 
       // Remove from cluster.agents
       cluster.agents.splice(agentIndex, 1);

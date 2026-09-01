@@ -56,6 +56,14 @@ describe('validateBasicStructure', function () {
     assert.ok(result.errors.some((e) => e.includes('Duplicate agent id')));
   });
 
+  it('should reject agent ids that are unsafe as telemetry path components', function () {
+    const result = validateBasicStructure({
+      agents: [{ id: '../worker', role: 'impl', triggers: [{ topic: 'A' }] }],
+    });
+
+    assert.ok(result.errors.some((e) => e.includes('safe identifier')));
+  });
+
   it('should reject empty triggers array', function () {
     const result = validateBasicStructure({
       agents: [{ id: 'worker', role: 'impl', triggers: [] }],

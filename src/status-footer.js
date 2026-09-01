@@ -78,6 +78,29 @@ function debounce(fn, ms) {
   };
 }
 
+function terminalCharacterWidth(character) {
+  return character.codePointAt(0) > 0x7f ? 2 : 1;
+}
+
+function terminalColumnWidth(value) {
+  return Array.from(value).reduce(
+    (columns, character) => columns + terminalCharacterWidth(character),
+    0
+  );
+}
+
+function truncateToTerminalColumns(value, maxColumns) {
+  let columns = 0;
+  let result = '';
+  for (const character of Array.from(value)) {
+    const width = terminalCharacterWidth(character);
+    if (columns + width > maxColumns) break;
+    result += character;
+    columns += width;
+  }
+  return result;
+}
+
 /**
  * @typedef {Object} AgentState
  * @property {string} id - Agent ID
@@ -592,17 +615,18 @@ class StatusFooter {
         .filter(([, agent]) => ACTIVE_STATES.has(agent.state))
         .slice(0, this.maxAgentRows);
 
-      // Count subagent rows for each executing agent
+      const agentRowCount = Math.max(1, executingAgents.length);
+      const maxSubagentRows = Math.max(0, rows - agentRowCount - 4);
       let subagentRowCount = 0;
       if (this.subagentTracker) {
         for (const [agentId] of executingAgents) {
           subagentRowCount += this.subagentTracker.getActiveSubagents(agentId).length;
         }
       }
+      subagentRowCount = Math.min(subagentRowCount, maxSubagentRows);
 
       // Calculate dynamic footer height: header + agent rows + subagent rows + summary
       // Minimum 3 lines (header + "no agents" message + summary)
-      const agentRowCount = Math.max(1, executingAgents.length);
       const newHeight = 2 + agentRowCount + subagentRowCount + 1; // header + agents + subagents + summary
 
       // Update scroll region if height changed
@@ -614,7 +638,7 @@ class StatusFooter {
 
       // Build footer lines
       const headerLine = this.buildHeaderLine(cols);
-      const agentRows = this.buildAgentRows(executingAgents, cols);
+      const agentRows = this.buildAgentRows(executingAgents, cols, maxSubagentRows);
       const summaryLine = this.buildSummaryLine(cols);
 
       // BUILD ENTIRE OUTPUT INTO SINGLE BUFFER for atomic write
@@ -699,7 +723,7 @@ class StatusFooter {
    * @param {number} width - Terminal width
    * @returns {Array<string>} Array of formatted rows
    */
-  buildAgentRows(executingAgents, width) {
+  buildAgentRows(executingAgents, width, maxSubagentRows = Infinity) {
     if (executingAgents.length === 0) {
       // No agents row
       const content = `${COLORS.gray}│${COLORS.reset}  ${COLORS.dim}No active agents${COLORS.reset}`;
@@ -709,6 +733,7 @@ class StatusFooter {
     }
 
     const rows = [];
+    let remainingSubagentRows = maxSubagentRows;
     for (const [agentId, agent] of executingAgents) {
       const icon = this.getAgentIcon(agent.state);
       const data = this.interpolatedMetrics.get(agentId);
@@ -753,19 +778,24 @@ class StatusFooter {
 
       // Append subagent rows (tree-prefixed, no metrics)
       if (this.subagentTracker) {
-        const subagents = this.subagentTracker.getActiveSubagents(agentId);
+        const subagents = this.subagentTracker
+          .getActiveSubagents(agentId)
+          .slice(0, remainingSubagentRows);
         for (let i = 0; i < subagents.length; i++) {
           const isLast = i === subagents.length - 1;
           const prefix = isLast ? '└─' : '├─';
-          const desc = subagents[i].description;
           const subIcon = this.blinkState
             ? `${COLORS.green}●${COLORS.reset}`
             : `${COLORS.dim}○${COLORS.reset}`;
-          const subContent = `${COLORS.gray}│${COLORS.reset}    ${COLORS.dim}${prefix}${COLORS.reset} ${subIcon} ${COLORS.dim}${desc}${COLORS.reset}`;
-          const subLen = this.stripAnsi(subContent).length;
+          const subPrefix = `${COLORS.gray}│${COLORS.reset}    ${COLORS.dim}${prefix}${COLORS.reset} ${subIcon} ${COLORS.dim}`;
+          const availableColumns = Math.max(0, width - this.stripAnsi(subPrefix).length - 1);
+          const desc = truncateToTerminalColumns(subagents[i].description, availableColumns);
+          const subContent = `${subPrefix}${desc}${COLORS.reset}`;
+          const subLen = terminalColumnWidth(this.stripAnsi(subContent));
           const subPad = Math.max(0, width - subLen - 1);
           rows.push(subContent + ' '.repeat(subPad) + `${COLORS.gray}│${COLORS.reset}`);
         }
+        remainingSubagentRows -= subagents.length;
       }
     }
 
@@ -976,12 +1006,12 @@ class StatusFooter {
       this.samplingIntervalId = null;
     }
 
-    // Stop subagent polling and cleanup temp files
+    // Stop subagent polling. The orchestrator owns the shared event directory;
+    // a temporary viewer must not remove files used by a running cluster.
     if (this.subagentPollId) {
       clearInterval(this.subagentPollId);
       this.subagentPollId = null;
     }
-    this.subagentTracker?.cleanup();
 
     // Remove resize listener
     process.stdout.removeListener('resize', this._debouncedResize);
