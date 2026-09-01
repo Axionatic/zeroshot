@@ -266,7 +266,6 @@ async function stop(agent, { requireTaskTermination = false, shutdownTimeoutMs =
   // Strict shutdown must observe and terminate that late task before succeeding.
   if (
     requireTaskTermination &&
-    !hasTrackedTask &&
     !killError &&
     !shutdownTimedOut &&
     (agent.currentTask || agent.currentTaskId)

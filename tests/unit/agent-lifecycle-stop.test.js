@@ -115,6 +115,45 @@ describe('agent lifecycle stop', function () {
     await assert.rejects(() => stopPromise, /late task kill failed/);
   });
 
+  it('strictly terminates a replacement task registered while the original kill settles', async () => {
+    let registerLateTask;
+    let finishOriginalKill;
+    let killCalls = 0;
+    const agent = createAgent({ currentTaskId: 'original-task' });
+    agent._currentExecution = new Promise((resolve) => {
+      registerLateTask = () => {
+        agent.currentTaskId = 'late-task';
+        resolve();
+      };
+    });
+    agent._killTask = () => {
+      killCalls++;
+      const capturedTaskId = agent.currentTaskId;
+      if (killCalls > 1) {
+        agent.currentTaskId = null;
+        return Promise.resolve();
+      }
+      return new Promise((resolve) => {
+        finishOriginalKill = () => {
+          if (agent.currentTaskId === capturedTaskId) agent.currentTaskId = null;
+          resolve();
+        };
+      });
+    };
+
+    const stopPromise = stop(agent, {
+      requireTaskTermination: true,
+      shutdownTimeoutMs: 100,
+    });
+    await Promise.resolve();
+    registerLateTask();
+    finishOriginalKill();
+    await stopPromise;
+
+    assert.strictEqual(killCalls, 2);
+    assert.strictEqual(agent.currentTaskId, null);
+  });
+
   it('does not start a replacement while an earlier execution is still pending', () => {
     const agent = createAgent({
       running: false,

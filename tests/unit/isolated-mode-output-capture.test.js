@@ -677,6 +677,78 @@ describe('isolated Codex terminal settlement', function () {
     assert.strictEqual(agent.currentTask, null);
   });
 
+  for (const terminalStatus of ['killed', 'stale (process died)']) {
+    it(`settles isolated tasks reporting ${terminalStatus}`, async () => {
+      const probe = createObserverProbe();
+      const tail = createTailProbe();
+      let statusCalls = 0;
+      const manager = {
+        spawnInContainer: () => tail.process,
+        execInContainer(_receivedClusterId, command) {
+          const shell = command[2];
+          if (shell.includes('get-log-path')) {
+            return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
+          }
+          if (shell.includes('zeroshot status')) {
+            statusCalls++;
+            return Promise.resolve({
+              code: 0,
+              stdout: `Status: ${terminalStatus}\n`,
+              stderr: '',
+            });
+          }
+          return Promise.resolve({ code: 0, stdout: '', stderr: '' });
+        },
+      };
+      const { agent } = createCodexAgent(manager);
+
+      const outcome = await Promise.race([
+        followClaudeTaskLogsIsolated(
+          agent,
+          `task-${terminalStatus.split(' ')[0]}`,
+          observerOptions(probe)
+        ),
+        new Promise((resolve) => setTimeout(() => resolve('pending'), 400)),
+      ]);
+
+      assert.notStrictEqual(outcome, 'pending');
+      assert.strictEqual(outcome.success, false);
+      assert.strictEqual(statusCalls, 1);
+      assert.strictEqual(agent.currentTask, null);
+    });
+  }
+
+  it('recognizes the CLI missing-ID result as terminal not-found', async () => {
+    const probe = createObserverProbe();
+    const tail = createTailProbe();
+    let statusCalls = 0;
+    const manager = {
+      spawnInContainer: () => tail.process,
+      execInContainer(_receivedClusterId, command) {
+        const shell = command[2];
+        if (shell.includes('get-log-path')) {
+          return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
+        }
+        if (shell.includes('zeroshot status')) {
+          statusCalls++;
+          return Promise.resolve({ code: 1, stdout: '', stderr: 'ID not found: missing-task' });
+        }
+        return Promise.resolve({ code: 0, stdout: '', stderr: '' });
+      },
+    };
+    const { agent } = createCodexAgent(manager);
+
+    const outcome = await followClaudeTaskLogsIsolated(
+      agent,
+      'missing-task',
+      observerOptions(probe)
+    );
+
+    assert.strictEqual(outcome.success, false);
+    assert.strictEqual(statusCalls, 1);
+    assert.strictEqual(agent.currentTask, null);
+  });
+
   it('serializes isolated status checks', async () => {
     const probe = createObserverProbe();
     const tail = createTailProbe();

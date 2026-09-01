@@ -2157,7 +2157,8 @@ function createIsolatedSettler({ agent, taskId, providerName, state, finalize, r
         await finalize({ drainOutput: true });
         resolve(await buildResult());
       } catch (error) {
-        const timeoutError = state.deadlineAt && Date.now() >= state.deadlineAt;
+        const timeoutError =
+          error?.finalDrainTimeout || (state.deadlineAt && Date.now() >= state.deadlineAt);
         reject(
           timeoutError
             ? new Error(`Task ${taskId} timeout after ${agent.timeout}ms (isolated mode)`)
@@ -2206,8 +2207,9 @@ async function checkIsolatedStatus({
     { timeout: statusTimeoutMs }
   );
 
-  const statusOutput = statusResult.stdout || statusResult.stderr || '';
-  const isNotFound = /Task not found/i.test(statusOutput) || statusOutput.includes('not_found');
+  const statusOutput = [statusResult.stdout, statusResult.stderr].filter(Boolean).join('\n');
+  const isNotFound =
+    /\b(?:task|id)\s+not\s+found\b/i.test(statusOutput) || /\bnot_found\b/i.test(statusOutput);
 
   if (statusResult.code !== 0 && !isNotFound) {
     throw new Error(
@@ -2217,14 +2219,18 @@ async function checkIsolatedStatus({
 
   const isSuccess = /Status:\s+completed/i.test(statusOutput);
   const isError = /Status:\s+failed/i.test(statusOutput);
+  const isKilled = /Status:\s+killed/i.test(statusOutput);
+  const isStale = /Status:\s+stale/i.test(statusOutput);
 
-  if (!isSuccess && !isError && !isNotFound) {
+  if (!isSuccess && !isError && !isKilled && !isStale && !isNotFound) {
     return;
   }
 
   await new Promise((r) => setTimeout(r, 200));
   await settler.resolve(async () => {
-    const success = isSuccess && !isError;
+    const success = isStale
+      ? determineStaleSuccess({ agent, output: state.fullOutput, providerName, taskId })
+      : isSuccess && !isError && !isKilled;
     const errorContext = !success
       ? extractErrorContext({
           output: state.fullOutput,
