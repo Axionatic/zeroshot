@@ -41,7 +41,7 @@ jobs:
             const fs = require("fs");
             const ids = (process.env.AUDIT_IGNORE || "").split(/[\n,]/)
               .map(l => l.replace(/#.*/,"").trim()).filter(Boolean);
-            // No patched extract-zip release exists; Puppeteer's removal requires Node >=22.12.
+            // No patched extract-zip release exists; removal in Puppeteer 25 requires Node >=22.12.
             const exclude = new Set([...ids, "GHSA-jmr9-qjv8-65gv"]);
             const data = JSON.parse(fs.readFileSync("/dev/stdin","utf8"));
             const found = Object.values(data.vulnerabilities || {})
