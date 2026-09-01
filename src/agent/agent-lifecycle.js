@@ -208,6 +208,7 @@ function start(agent) {
  * @returns {Promise<void>}
  */
 async function stop(agent, { requireTaskTermination = false, shutdownTimeoutMs = 5000 } = {}) {
+  const shutdownDeadline = Date.now() + shutdownTimeoutMs;
   const hasTrackedTask = !!(agent.currentTask || agent.currentTaskId);
   const hasPendingExecution = !!agent._currentExecution;
   if (!agent.running && !(requireTaskTermination && (hasTrackedTask || hasPendingExecution))) {
@@ -259,6 +260,40 @@ async function stop(agent, { requireTaskTermination = false, shutdownTimeoutMs =
       }),
     ]);
     clearTimeout(timeoutHandle);
+  }
+
+  // A task can be registered while the in-flight execution is winding down.
+  // Strict shutdown must observe and terminate that late task before succeeding.
+  if (
+    requireTaskTermination &&
+    !hasTrackedTask &&
+    !killError &&
+    !shutdownTimedOut &&
+    (agent.currentTask || agent.currentTaskId)
+  ) {
+    const remainingMs = shutdownDeadline - Date.now();
+    if (remainingMs <= 0) {
+      shutdownTimedOut = true;
+    } else {
+      let timeoutHandle;
+      await Promise.race([
+        Promise.resolve()
+          .then(() => agent._killTask())
+          .catch((error) => {
+            killError = error;
+          })
+          .finally(() => {
+            killFinished = true;
+          }),
+        new Promise((resolve) => {
+          timeoutHandle = setTimeout(() => {
+            shutdownTimedOut = true;
+            resolve();
+          }, remainingMs);
+        }),
+      ]);
+      clearTimeout(timeoutHandle);
+    }
   }
 
   agent._log(`Agent ${agent.id} stopped`);

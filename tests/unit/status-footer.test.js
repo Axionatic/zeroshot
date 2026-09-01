@@ -68,4 +68,27 @@ describe('StatusFooter subagent event ownership', () => {
 
     assert.strictEqual(rows.length, 6);
   });
+
+  it('clips subagent labels to the terminal width', () => {
+    const footer = new StatusFooter({ enabled: false });
+    footer.subagentTracker = {
+      getActiveSubagents: () => [
+        { id: 'sub-1', description: 'x'.repeat(80) },
+        { id: 'sub-2', description: '界'.repeat(80) },
+      ],
+    };
+
+    const rows = footer.buildAgentRows(
+      [['worker', { state: AGENT_STATE.EXECUTING_TASK, iteration: 1 }]],
+      40,
+      2
+    );
+
+    const displayWidth = (value) =>
+      Array.from(footer.stripAnsi(value)).reduce(
+        (width, character) => width + (character === '界' ? 2 : 1),
+        0
+      );
+    assert.ok(rows.slice(1).every((row) => displayWidth(row) <= 40));
+  });
 });

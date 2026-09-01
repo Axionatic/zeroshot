@@ -94,6 +94,27 @@ describe('agent lifecycle stop', function () {
     assert.strictEqual(agent.state, 'stopped');
   });
 
+  it('fails strict stop when a late-registered task cannot be terminated', async function () {
+    let releaseExecution;
+    const execution = new Promise((resolve) => {
+      releaseExecution = resolve;
+    });
+    const agent = createAgent({
+      currentTaskId: null,
+      _currentExecution: execution,
+      _killTask: () => Promise.reject(new Error('late task kill failed')),
+    });
+
+    const stopPromise = stop(agent, {
+      requireTaskTermination: true,
+      shutdownTimeoutMs: 100,
+    });
+    agent.currentTaskId = 'late-task';
+    releaseExecution();
+
+    await assert.rejects(() => stopPromise, /late task kill failed/);
+  });
+
   it('does not start a replacement while an earlier execution is still pending', () => {
     const agent = createAgent({
       running: false,

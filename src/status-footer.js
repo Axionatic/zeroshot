@@ -78,6 +78,29 @@ function debounce(fn, ms) {
   };
 }
 
+function terminalCharacterWidth(character) {
+  return character.codePointAt(0) > 0x7f ? 2 : 1;
+}
+
+function terminalColumnWidth(value) {
+  return Array.from(value).reduce(
+    (columns, character) => columns + terminalCharacterWidth(character),
+    0
+  );
+}
+
+function truncateToTerminalColumns(value, maxColumns) {
+  let columns = 0;
+  let result = '';
+  for (const character of Array.from(value)) {
+    const width = terminalCharacterWidth(character);
+    if (columns + width > maxColumns) break;
+    result += character;
+    columns += width;
+  }
+  return result;
+}
+
 /**
  * @typedef {Object} AgentState
  * @property {string} id - Agent ID
@@ -761,12 +784,14 @@ class StatusFooter {
         for (let i = 0; i < subagents.length; i++) {
           const isLast = i === subagents.length - 1;
           const prefix = isLast ? '└─' : '├─';
-          const desc = subagents[i].description;
           const subIcon = this.blinkState
             ? `${COLORS.green}●${COLORS.reset}`
             : `${COLORS.dim}○${COLORS.reset}`;
-          const subContent = `${COLORS.gray}│${COLORS.reset}    ${COLORS.dim}${prefix}${COLORS.reset} ${subIcon} ${COLORS.dim}${desc}${COLORS.reset}`;
-          const subLen = this.stripAnsi(subContent).length;
+          const subPrefix = `${COLORS.gray}│${COLORS.reset}    ${COLORS.dim}${prefix}${COLORS.reset} ${subIcon} ${COLORS.dim}`;
+          const availableColumns = Math.max(0, width - this.stripAnsi(subPrefix).length - 1);
+          const desc = truncateToTerminalColumns(subagents[i].description, availableColumns);
+          const subContent = `${subPrefix}${desc}${COLORS.reset}`;
+          const subLen = terminalColumnWidth(this.stripAnsi(subContent));
           const subPad = Math.max(0, width - subLen - 1);
           rows.push(subContent + ' '.repeat(subPad) + `${COLORS.gray}│${COLORS.reset}`);
         }

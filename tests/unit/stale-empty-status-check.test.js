@@ -133,6 +133,31 @@ describe('handleStatusCompletion stale + empty output guard', () => {
     assert.deepStrictEqual(sequence, ['finalize', 'resolve']);
   });
 
+  it('treats a killed task as terminal instead of polling forever', async () => {
+    const sequence = [];
+    let resolveResult;
+    const settled = new Promise((resolve) => {
+      resolveResult = (value) => {
+        sequence.push('resolve');
+        resolve(value);
+      };
+    });
+    const result = handleStatusCompletion({
+      agent: makeAgent(),
+      taskId: 'task-1',
+      providerName: 'claude',
+      state: makeState(''),
+      stdout: 'Status: killed',
+      pollLogFile: () => {},
+      resolve: resolveResult,
+      finalize: () => sequence.push('finalize'),
+    });
+
+    assert.strictEqual(result, true);
+    await settled;
+    assert.deepStrictEqual(sequence, ['finalize', 'resolve']);
+  });
+
   it('returns false when status is not terminal', () => {
     const result = handleStatusCompletion({
       agent: makeAgent(),

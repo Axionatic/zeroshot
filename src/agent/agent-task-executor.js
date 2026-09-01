@@ -782,10 +782,18 @@ async function spawnClaudeTask(agent, context) {
     spawnEnv,
   });
 
+  if (!agent.running) {
+    throw new Error(`Agent ${agent.id} stopped before task startup completed`);
+  }
+
   agent._log(`📋 Agent ${agent.id}: Following zeroshot logs for ${taskId}`);
 
   // Wait for task to be registered in zeroshot storage (race condition fix)
   await waitForTaskReady(agent, taskId);
+
+  if (!agent.running) {
+    throw new Error(`Agent ${agent.id} stopped before task startup completed`);
+  }
 
   // CRITICAL: Poll for REAL process PID from task store
   // The watcher spawns the actual CLI and writes PID to SQLite asynchronously.
@@ -795,12 +803,19 @@ async function spawnClaudeTask(agent, context) {
   let realPid = null;
 
   for (let i = 0; i < MAX_PID_POLLS; i++) {
+    if (!agent.running) {
+      throw new Error(`Agent ${agent.id} stopped before task startup completed`);
+    }
     const taskInfo = getTask(taskId);
     if (taskInfo?.pid) {
       realPid = taskInfo.pid;
       break;
     }
     await new Promise((r) => setTimeout(r, PID_POLL_DELAY));
+  }
+
+  if (!agent.running) {
+    throw new Error(`Agent ${agent.id} stopped before task startup completed`);
   }
 
   if (realPid) {
@@ -1312,6 +1327,7 @@ function parseStatusFlags(cleanStdout) {
     isCompleted: /Status:\s+completed/i.test(cleanStdout),
     isFailed: /Status:\s+failed/i.test(cleanStdout),
     isStale: /Status:\s+stale/i.test(cleanStdout),
+    isKilled: /Status:\s+killed/i.test(cleanStdout),
   };
 }
 
@@ -1532,9 +1548,9 @@ function handleStatusCompletion({
   finalize,
 }) {
   const cleanStdout = stripAnsiCodes(stdout);
-  const { isCompleted, isFailed, isStale } = parseStatusFlags(cleanStdout);
+  const { isCompleted, isFailed, isStale, isKilled } = parseStatusFlags(cleanStdout);
 
-  if (!isCompleted && !isFailed && !isStale) {
+  if (!isCompleted && !isFailed && !isStale && !isKilled) {
     return false;
   }
 
@@ -1870,6 +1886,10 @@ async function spawnClaudeTaskIsolated(agent, context) {
     });
   });
 
+  if (!agent.running) {
+    throw new Error(`Agent ${agent.id} stopped before task startup completed`);
+  }
+
   agent._log(`📋 Agent ${agent.id}: Following zeroshot logs for ${taskId} in container...`);
 
   // STEP 2: Follow the task's log file inside container (NOT the spawn stdout!)
@@ -2020,14 +2040,19 @@ function startIsolatedTail({ agent, manager, clusterId, logFilePath, state, onLi
 
 async function drainIsolatedLog({ manager, clusterId, state, onLine }) {
   if (!state.logFilePath) return;
-  const finalReadPromise = manager.execInContainer(clusterId, [
-    'sh',
-    '-c',
-    `cat "${state.logFilePath}" 2>/dev/null || echo ""`,
-  ]);
+  const remainingMs = state.deadlineAt ? Math.max(0, state.deadlineAt - Date.now()) : null;
+  if (remainingMs === 0) {
+    const error = new Error('Task final output drain exceeded its timeout');
+    error.finalDrainTimeout = true;
+    throw error;
+  }
+  const finalReadPromise = manager.execInContainer(
+    clusterId,
+    ['sh', '-c', `cat "${state.logFilePath}" 2>/dev/null || echo ""`],
+    remainingMs === null ? {} : { timeout: remainingMs }
+  );
   let finalReadResult;
   if (state.deadlineAt) {
-    const remainingMs = Math.max(0, state.deadlineAt - Date.now());
     let drainTimeoutHandle;
     try {
       finalReadResult = await Promise.race([
@@ -2171,25 +2196,27 @@ async function checkIsolatedStatus({
   providerName,
   state,
   settler,
+  statusTimeoutMs,
 }) {
   if (state.taskExited) return;
 
-  const statusResult = await manager.execInContainer(clusterId, [
-    'sh',
-    '-c',
-    `zeroshot status ${taskId} 2>/dev/null || echo "not_found"`,
-  ]);
+  const statusResult = await manager.execInContainer(
+    clusterId,
+    ['sh', '-c', `zeroshot status ${taskId} 2>&1`],
+    { timeout: statusTimeoutMs }
+  );
 
-  if (statusResult.code !== 0) {
+  const statusOutput = statusResult.stdout || statusResult.stderr || '';
+  const isNotFound = /Task not found/i.test(statusOutput) || statusOutput.includes('not_found');
+
+  if (statusResult.code !== 0 && !isNotFound) {
     throw new Error(
       `Isolated status command failed with code ${statusResult.code}: ${statusResult.stderr || statusResult.stdout || 'no output'}`
     );
   }
 
-  const statusOutput = statusResult.stdout;
   const isSuccess = /Status:\s+completed/i.test(statusOutput);
   const isError = /Status:\s+failed/i.test(statusOutput);
-  const isNotFound = statusOutput.includes('not_found');
 
   if (!isSuccess && !isError && !isNotFound) {
     return;
@@ -2253,6 +2280,7 @@ function startIsolatedStatusChecks({
           providerName,
           state,
           settler,
+          statusTimeoutMs: statusIntervalMs,
         });
         state.statusFailureCount = 0;
       } catch (statusErr) {

@@ -659,6 +659,7 @@ describe('isolated Codex terminal settlement', function () {
           return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
         }
         if (shell.includes('zeroshot status')) {
+          assert.strictEqual(shell.includes('|| echo'), false);
           statusCalls++;
           return Promise.resolve({ code: 125, stdout: '', stderr: 'container missing' });
         }
@@ -715,12 +716,45 @@ describe('isolated Codex terminal settlement', function () {
     assert.strictEqual(maxInFlight, 1);
   });
 
+  it('bounds each serialized status command by the polling interval', async () => {
+    const probe = createObserverProbe();
+    const tail = createTailProbe();
+    let receivedTimeout;
+    const manager = {
+      spawnInContainer: () => tail.process,
+      execInContainer(_receivedClusterId, command, options = {}) {
+        const shell = command[2];
+        if (shell.includes('get-log-path')) {
+          return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
+        }
+        if (shell.includes('zeroshot status')) {
+          receivedTimeout = options.timeout;
+          return Promise.resolve({ code: 0, stdout: 'Status: running\n', stderr: '' });
+        }
+        return Promise.resolve({ code: 0, stdout: '', stderr: '' });
+      },
+    };
+    const { agent } = createCodexAgent(manager);
+    const taskPromise = followClaudeTaskLogsIsolated(
+      agent,
+      'task-status-timeout',
+      observerOptions(probe, { statusIntervalMs: 20 })
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    await agent.currentTask.kill('test complete');
+    await taskPromise;
+
+    assert.strictEqual(receivedTimeout, 20);
+  });
+
   it('keeps terminal final-drain work within the configured timeout', async () => {
     const probe = createObserverProbe();
     const tail = createTailProbe();
+    let drainTimeout;
     const manager = {
       spawnInContainer: () => tail.process,
-      execInContainer(_receivedClusterId, command) {
+      execInContainer(_receivedClusterId, command, options = {}) {
         const shell = command[2];
         if (shell.includes('get-log-path')) {
           return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
@@ -728,19 +762,21 @@ describe('isolated Codex terminal settlement', function () {
         if (shell.includes('zeroshot status')) {
           return Promise.resolve({ code: 0, stdout: 'Status: completed\n', stderr: '' });
         }
+        drainTimeout = options.timeout;
         return new Promise(() => {});
       },
     };
-    const { agent } = createCodexAgent(manager, { timeout: 30 });
+    const { agent } = createCodexAgent(manager, { timeout: 300 });
     const outcome = await Promise.race([
       followClaudeTaskLogsIsolated(agent, 'task-hung-final-drain', observerOptions(probe)).then(
         () => 'resolved',
         (error) => error.message
       ),
-      new Promise((resolve) => setTimeout(() => resolve('pending'), 100)),
+      new Promise((resolve) => setTimeout(() => resolve('pending'), 500)),
     ]);
 
-    assert.match(outcome, /timeout after 30ms/);
+    assert.match(outcome, /timeout after 300ms/);
+    assert.ok(drainTimeout > 0 && drainTimeout <= 300);
     assert.strictEqual(agent.currentTask, null);
   });
 
