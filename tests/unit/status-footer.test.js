@@ -49,4 +49,23 @@ describe('StatusFooter subagent event ownership', () => {
       fs.rmSync(eventsDir, { recursive: true, force: true });
     }
   });
+
+  it('limits rendered subagent rows to the available footer budget', () => {
+    const footer = new StatusFooter({ enabled: false });
+    footer.subagentTracker = {
+      getActiveSubagents: () =>
+        Array.from({ length: 100 }, (_, index) => ({
+          id: `sub-${index}`,
+          description: `Subagent ${index}`,
+        })),
+    };
+
+    const rows = footer.buildAgentRows(
+      [['worker', { state: AGENT_STATE.EXECUTING_TASK, iteration: 1 }]],
+      80,
+      5
+    );
+
+    assert.strictEqual(rows.length, 6);
+  });
 });

@@ -193,10 +193,10 @@ export function isProcessRunning(pid) {
   }
 }
 
-export function killTask(pid) {
+export function killTask(pid, signal = 'SIGTERM') {
   if (!pid) return false;
   try {
-    process.kill(pid, 'SIGTERM');
+    process.kill(pid, signal);
     return true;
   } catch {
     return false;

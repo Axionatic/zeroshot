@@ -86,7 +86,12 @@ describe('Retry does not increment iteration counter', function () {
 
     mockRunner.assertCalled('worker', 1);
     assert.match(cluster.failureInfo.error, /termination failed/);
-    assert.strictEqual(worker.state, 'idle');
+    assert.strictEqual(worker.state, 'error');
+    const [clusterFailure] = messageBus.query({
+      cluster_id: cluster.id,
+      topic: 'CLUSTER_FAILED',
+    });
+    assert.strictEqual(clusterFailure.content.data.reason, 'task_termination_failed');
 
     await worker.stop();
   });

@@ -2,6 +2,21 @@ const fs = require('fs');
 const path = require('path');
 const { getSubagentEventsDir } = require('./subagent-events');
 const MAX_EVENT_READ_BYTES = 1024 * 1024;
+const MAX_ACTIVE_SUBAGENTS = 100;
+const MAX_LABEL_LENGTH = 80;
+const MAX_SUBAGENT_ID_LENGTH = 128;
+
+function normalizeLabel(value) {
+  const printable = Array.from(value)
+    .filter((character) => {
+      const codePoint = character.codePointAt(0);
+      return codePoint > 31 && !(codePoint >= 127 && codePoint <= 159);
+    })
+    .join('')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return Array.from(printable).slice(0, MAX_LABEL_LENGTH).join('');
+}
 
 class SubagentTracker {
   /**
@@ -105,6 +120,7 @@ class SubagentTracker {
       (event.event !== 'start' && event.event !== 'stop') ||
       typeof event.agent_id !== 'string' ||
       !event.agent_id.trim() ||
+      event.agent_id.length > MAX_SUBAGENT_ID_LENGTH ||
       typeof event.ts !== 'number' ||
       !Number.isFinite(event.ts) ||
       (event.description !== undefined && typeof event.description !== 'string') ||
@@ -120,9 +136,11 @@ class SubagentTracker {
 
     if (event.event === 'start') {
       if (list.some((subagent) => subagent.id === event.agent_id)) return;
+      if (list.length >= MAX_ACTIVE_SUBAGENTS) return;
       list.push({
         id: event.agent_id,
-        description: event.description || event.agent_type || 'subagent',
+        description:
+          normalizeLabel(event.description || event.agent_type || 'subagent') || 'subagent',
         startedAt: event.ts,
       });
     } else if (event.event === 'stop') {

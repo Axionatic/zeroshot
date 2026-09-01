@@ -42,6 +42,42 @@ describe('SubagentTracker', () => {
     assert.strictEqual(active[1].description, 'Logic Flow Tracer review');
   });
 
+  it('normalizes and bounds labels at the shared consumer boundary', () => {
+    const tracker = new SubagentTracker(TEST_CLUSTER_ID);
+    const unsafe = `review\u001b]0;owned\u0007\nnext ${'x'.repeat(200)}`;
+    writeEvents('analyst', [{ event: 'start', agent_id: 'sub-1', description: unsafe, ts: 1000 }]);
+
+    tracker.poll();
+    const [active] = tracker.getActiveSubagents('analyst');
+
+    assert.strictEqual(active.description.includes('\n'), false);
+    assert.strictEqual(
+      Array.from(active.description).some((character) => {
+        const codePoint = character.codePointAt(0);
+        return codePoint <= 31 || (codePoint >= 127 && codePoint <= 159);
+      }),
+      false
+    );
+    assert.ok(active.description.length <= 80);
+  });
+
+  it('caps active children retained for one parent', () => {
+    const tracker = new SubagentTracker(TEST_CLUSTER_ID);
+    writeEvents(
+      'analyst',
+      Array.from({ length: 200 }, (_, index) => ({
+        event: 'start',
+        agent_id: `sub-${index}`,
+        description: `Subagent ${index}`,
+        ts: index,
+      }))
+    );
+
+    tracker.poll();
+
+    assert.ok(tracker.getActiveSubagents('analyst').length <= 100);
+  });
+
   it('returns only active subagents (started, not stopped)', () => {
     const tracker = new SubagentTracker(TEST_CLUSTER_ID);
 

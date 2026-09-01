@@ -1025,6 +1025,14 @@ function spawnTaskProcess({ agent, ctPath, args, cwd, spawnEnv }) {
         const spawnedTaskId = parseTaskIdFromOutput(stdout);
         if (spawnedTaskId) {
           agent.currentTaskId = spawnedTaskId; // Track for resume capability
+          if (!agent.running) {
+            Promise.resolve(agent._killTask())
+              .then(() =>
+                reject(new Error(`Agent ${agent.id} stopped before task startup completed`))
+              )
+              .catch((error) => reject(error));
+            return;
+          }
           agent._publishLifecycle('TASK_ID_ASSIGNED', {
             pid: agent.processPid,
             taskId: spawnedTaskId,
@@ -1826,6 +1834,14 @@ async function spawnClaudeTaskIsolated(agent, context) {
         const spawnedTaskId = parseTaskIdFromOutput(stdout);
         if (spawnedTaskId) {
           agent.currentTaskId = spawnedTaskId; // Track for resume capability
+          if (!agent.running) {
+            Promise.resolve(agent._killTask())
+              .then(() =>
+                reject(new Error(`Agent ${agent.id} stopped before task startup completed`))
+              )
+              .catch((error) => reject(error));
+            return;
+          }
           agent._publishLifecycle('TASK_ID_ASSIGNED', {
             pid: agent.processPid,
             taskId: spawnedTaskId,
@@ -1893,6 +1909,7 @@ function createIsolatedLogState() {
     statusCheckInterval: null,
     statusFailureCount: 0,
     timeoutHandle: null,
+    deadlineAt: null,
     lineBuffer: '',
     logFilePath: null,
     tailDecoder: new StringDecoder('utf8'),
@@ -1911,7 +1928,7 @@ function buildIsolatedCleanup(state) {
       state.tailProcess = null;
     }
     if (state.statusCheckInterval) {
-      clearInterval(state.statusCheckInterval);
+      clearTimeout(state.statusCheckInterval);
       state.statusCheckInterval = null;
     }
     if (state.timeoutHandle) {
@@ -2003,11 +2020,32 @@ function startIsolatedTail({ agent, manager, clusterId, logFilePath, state, onLi
 
 async function drainIsolatedLog({ manager, clusterId, state, onLine }) {
   if (!state.logFilePath) return;
-  const finalReadResult = await manager.execInContainer(clusterId, [
+  const finalReadPromise = manager.execInContainer(clusterId, [
     'sh',
     '-c',
     `cat "${state.logFilePath}" 2>/dev/null || echo ""`,
   ]);
+  let finalReadResult;
+  if (state.deadlineAt) {
+    const remainingMs = Math.max(0, state.deadlineAt - Date.now());
+    let drainTimeoutHandle;
+    try {
+      finalReadResult = await Promise.race([
+        finalReadPromise,
+        new Promise((_, reject) => {
+          drainTimeoutHandle = setTimeout(() => {
+            const error = new Error('Task final output drain exceeded its timeout');
+            error.finalDrainTimeout = true;
+            reject(error);
+          }, remainingMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(drainTimeoutHandle);
+    }
+  } else {
+    finalReadResult = await finalReadPromise;
+  }
 
   if (finalReadResult.code === 0 && finalReadResult.stdout) {
     state.fullOutput = finalReadResult.stdout;
@@ -2049,28 +2087,38 @@ function createIsolatedFinalizer({
     if (state.finalizationPromise) return state.finalizationPromise;
     state.taskExited = true;
     state.finalizationPromise = (async () => {
-      if (drainOutput) {
+      if (state.tailProcess) {
         try {
-          await drainIsolatedLog({ manager, clusterId, state, onLine });
+          state.tailProcess.kill('SIGTERM');
         } catch {
-          // Preserve the existing result path when the final output read fails.
+          // Ignore - process may already be dead.
+        }
+        state.tailProcess = null;
+      }
+      if (state.statusCheckInterval) {
+        clearTimeout(state.statusCheckInterval);
+        state.statusCheckInterval = null;
+      }
+      try {
+        if (drainOutput) {
+          try {
+            await drainIsolatedLog({ manager, clusterId, state, onLine });
+          } catch (error) {
+            if (error?.finalDrainTimeout) throw error;
+            // A best-effort final read must not replace the provider result.
+          }
+        }
+        await observerFinalizer();
+      } finally {
+        cleanup();
+        if (agent._subagentTrackingCleanup === trackingCleanup) {
+          agent._subagentTrackingCleanup = null;
+        }
+        if (agent.currentTask === state.taskHandle) {
+          agent.currentTask = null;
         }
       }
-      void observerFinalizer();
-      try {
-        cleanup();
-      } catch {
-        // Cleanup is best effort on every settle path.
-      }
-      if (agent._subagentTrackingCleanup === trackingCleanup) {
-        agent._subagentTrackingCleanup = null;
-      }
-      if (agent.currentTask === state.taskHandle) {
-        agent.currentTask = null;
-      }
-    })().catch(() => {
-      // Finalization is deliberately non-throwing.
-    });
+    })();
     return state.finalizationPromise;
   };
 }
@@ -2080,11 +2128,16 @@ function createIsolatedSettler({ agent, taskId, providerName, state, finalize, r
     resolve: async (buildResult) => {
       if (state.settled) return;
       state.settled = true;
-      await finalize({ drainOutput: true });
       try {
+        await finalize({ drainOutput: true });
         resolve(await buildResult());
       } catch (error) {
-        reject(error);
+        const timeoutError = state.deadlineAt && Date.now() >= state.deadlineAt;
+        reject(
+          timeoutError
+            ? new Error(`Task ${taskId} timeout after ${agent.timeout}ms (isolated mode)`)
+            : error
+        );
       }
     },
     reject: async (error) => {
@@ -2126,6 +2179,12 @@ async function checkIsolatedStatus({
     '-c',
     `zeroshot status ${taskId} 2>/dev/null || echo "not_found"`,
   ]);
+
+  if (statusResult.code !== 0) {
+    throw new Error(
+      `Isolated status command failed with code ${statusResult.code}: ${statusResult.stderr || statusResult.stdout || 'no output'}`
+    );
+  }
 
   const statusOutput = statusResult.stdout;
   const isSuccess = /Status:\s+completed/i.test(statusOutput);
@@ -2181,39 +2240,42 @@ function startIsolatedStatusChecks({
   statusIntervalMs,
   maxStatusFailures,
 }) {
-  state.statusCheckInterval = setInterval(() => {
-    checkIsolatedStatus({
-      agent,
-      manager,
-      clusterId,
-      logFilePath,
-      taskId,
-      providerName,
-      state,
-      settler,
-    })
-      .then(() => {
+  const schedule = () => {
+    if (state.taskExited) return;
+    state.statusCheckInterval = setTimeout(async () => {
+      try {
+        await checkIsolatedStatus({
+          agent,
+          manager,
+          clusterId,
+          logFilePath,
+          taskId,
+          providerName,
+          state,
+          settler,
+        });
         state.statusFailureCount = 0;
-      })
-      .catch((statusErr) => {
+      } catch (statusErr) {
         state.statusFailureCount++;
         if (state.statusFailureCount >= maxStatusFailures) {
-          settler
-            .reject(
-              new Error(
-                `Isolated status check failed ${state.statusFailureCount} consecutive times for task ${taskId}: ${statusErr.message}`
-              )
+          await settler.reject(
+            new Error(
+              `Isolated status check failed ${state.statusFailureCount} consecutive times for task ${taskId}: ${statusErr.message}`
             )
-            .catch(() => {});
+          );
           return;
         }
         agent._log(`[${agent.id}] Status check error (will retry): ${statusErr.message}`);
-      });
-  }, statusIntervalMs);
+      }
+      schedule();
+    }, statusIntervalMs);
+  };
+  schedule();
 }
 
 function installIsolatedTimeout({ agent, taskId, state, settler }) {
   if (agent.timeout > 0) {
+    state.deadlineAt = Date.now() + agent.timeout;
     state.timeoutHandle = setTimeout(() => {
       if (state.taskExited) return;
       settler

@@ -187,4 +187,26 @@ describe('spawnTask provider commandSpec execution', function () {
       if (isProcessRunning(child.pid)) child.kill('SIGKILL');
     }
   });
+
+  it('escalates to SIGKILL when the provider ignores SIGTERM', async function () {
+    this.timeout(7000);
+    const child = spawn(
+      process.execPath,
+      ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);"],
+      { stdio: 'ignore' }
+    );
+    const taskId = `kill-escalate-${process.pid}-${Date.now()}`;
+
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      addTask({ id: taskId, status: 'running', pid: child.pid });
+
+      await killTaskCommand(taskId, { termTimeoutMs: 50, killTimeoutMs: 1000 });
+
+      expect(isProcessRunning(child.pid)).to.equal(false);
+      expect(getTask(taskId).status).to.equal('killed');
+    } finally {
+      if (isProcessRunning(child.pid)) child.kill('SIGKILL');
+    }
+  });
 });

@@ -167,6 +167,9 @@ function start(agent) {
   if (agent.running) {
     throw new Error(`Agent ${agent.id} is already running`);
   }
+  if (agent._currentExecution) {
+    throw new Error(`Agent ${agent.id} execution is still pending`);
+  }
 
   agent.running = true;
   agent.state = 'idle';
@@ -669,6 +672,8 @@ async function runTaskAttempt(agent, triggeringMessage) {
     orchestrator: agent.orchestrator,
   });
 
+  if (!agent.running) return;
+
   // Build context
   agent.state = 'building_context';
   const context = agent._buildContext(triggeringMessage);
@@ -679,6 +684,7 @@ async function runTaskAttempt(agent, triggeringMessage) {
   // Spawn provider task
   agent.state = 'executing_task';
   await applyValidatorJitter(agent);
+  if (!agent.running) return;
   publishTaskStarted(agent, triggeringMessage);
 
   const result = await agent._spawnClaudeTask(context);
@@ -802,6 +808,23 @@ ${'='.repeat(80)}`);
     });
   }
 
+  if (error?.terminationFailure) {
+    agent._publish({
+      topic: 'CLUSTER_FAILED',
+      receiver: 'broadcast',
+      content: {
+        text: `Cluster failed: task cleanup failed for ${agent.id} - ${error.message}`,
+        data: {
+          reason: 'task_termination_failed',
+          agentId: agent.id,
+          role: agent.role,
+          taskId: agent.currentTaskId,
+          error: error.message,
+        },
+      },
+    });
+  }
+
   // Save failure info to cluster for resume capability
   agent.cluster.failureInfo = {
     agentId: agent.id,
@@ -855,7 +878,9 @@ ${'='.repeat(80)}`);
     orchestrator: agent.orchestrator,
   });
 
-  agent.state = 'idle';
+  if (!error?.terminationFailure) {
+    agent.state = 'idle';
+  }
 }
 
 async function scheduleRetry(agent, error, attempt, maxRetries, _baseDelay) {
@@ -1003,6 +1028,7 @@ async function executeTask(agent, triggeringMessage) {
           `Task attempt failed and cleanup could not terminate it: ${killError.message}`
         );
         terminationError.cause = killError;
+        terminationError.terminationFailure = true;
         await handleFinalFailure(agent, triggeringMessage, terminationError, attempt);
         return;
       }

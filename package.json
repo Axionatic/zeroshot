@@ -98,6 +98,8 @@
     "docker/",
     "scripts/",
     ".dockerignore",
+    "tsconfig.agent-cli-provider.json",
+    "tsconfig.agent-cli-provider.build.json",
     "README.md",
     "LICENSE"
   ],

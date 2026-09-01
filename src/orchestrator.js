@@ -54,6 +54,7 @@ const { loadSettings } = require('../lib/settings');
 const { normalizeProviderName } = require('../lib/provider-names');
 const { getProvider } = require('./providers');
 const StateSnapshotter = require('./state-snapshotter');
+const { getSubagentEventsDir } = require('./subagent-events');
 const { resolveClusterRequiredQualityGates } = require('./quality-gates');
 const {
   commandProofsToQualityGates,
@@ -512,6 +513,8 @@ class Orchestrator {
     if (!requestedClusterId) {
       return this._generateUniqueClusterId(null, dbPath || null);
     }
+
+    getSubagentEventsDir(requestedClusterId);
 
     const existingCluster = this.clusters.get(requestedClusterId);
     const candidateDbPath = dbPath || path.join(this.storageDir, `${requestedClusterId}.db`);
@@ -2343,8 +2346,8 @@ class Orchestrator {
    * @private
    */
   _cleanupSubagentEvents(clusterId) {
+    const dir = getSubagentEventsDir(clusterId);
     try {
-      const dir = path.join(os.tmpdir(), 'zeroshot-subagents', clusterId);
       fs.rmSync(dir, { recursive: true, force: true });
     } catch {
       // Already gone or never created

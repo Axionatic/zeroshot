@@ -11,7 +11,7 @@ async function waitForProcessExit(pid, timeoutMs = 5000) {
   return !isProcessRunning(pid);
 }
 
-export async function killTaskCommand(taskId) {
+export async function killTaskCommand(taskId, { termTimeoutMs = 5000, killTimeoutMs = 5000 } = {}) {
   const task = getTask(taskId);
 
   if (!task) {
@@ -37,8 +37,14 @@ export async function killTaskCommand(taskId) {
   }
 
   console.log(chalk.green(`✓ Sent SIGTERM to task ${taskId} (PID: ${task.pid})`));
-  if (!(await waitForProcessExit(task.pid))) {
-    throw new Error(`Task ${taskId} did not exit after SIGTERM`);
+  if (!(await waitForProcessExit(task.pid, termTimeoutMs))) {
+    if (!killProcess(task.pid, 'SIGKILL')) {
+      throw new Error(`Failed to send SIGKILL to task ${taskId}`);
+    }
+    console.log(chalk.green(`✓ Sent SIGKILL to task ${taskId} (PID: ${task.pid})`));
+    if (!(await waitForProcessExit(task.pid, killTimeoutMs))) {
+      throw new Error(`Task ${taskId} did not exit after SIGKILL`);
+    }
   }
   updateTask(taskId, { status: 'killed', error: 'Killed by user' });
 }
