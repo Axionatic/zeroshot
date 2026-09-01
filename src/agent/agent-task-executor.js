@@ -1928,6 +1928,7 @@ function createIsolatedLogState() {
     tailProcess: null,
     statusCheckInterval: null,
     statusFailureCount: 0,
+    emptyStaleCount: 0,
     timeoutHandle: null,
     deadlineAt: null,
     lineBuffer: '',
@@ -2229,7 +2230,10 @@ async function checkIsolatedStatus({
   // A task record is created with pid=null before its watcher records the PID,
   // so an empty stale result can be a startup race rather than task death.
   if (isStale && !state.fullOutput) {
-    return;
+    state.emptyStaleCount++;
+    if (state.emptyStaleCount === 1) return;
+  } else {
+    state.emptyStaleCount = 0;
   }
 
   await new Promise((r) => setTimeout(r, 200));

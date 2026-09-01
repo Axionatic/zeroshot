@@ -677,7 +677,7 @@ describe('isolated Codex terminal settlement', function () {
     assert.strictEqual(agent.currentTask, null);
   });
 
-  for (const terminalStatus of ['killed']) {
+  for (const terminalStatus of ['killed', 'stale (process died)']) {
     it(`settles isolated tasks reporting ${terminalStatus}`, async () => {
       const probe = createObserverProbe();
       const tail = createTailProbe();
@@ -713,7 +713,7 @@ describe('isolated Codex terminal settlement', function () {
 
       assert.notStrictEqual(outcome, 'pending');
       assert.strictEqual(outcome.success, false);
-      assert.strictEqual(statusCalls, 1);
+      assert.strictEqual(statusCalls, terminalStatus.startsWith('stale') ? 2 : 1);
       assert.strictEqual(agent.currentTask, null);
     });
   }
