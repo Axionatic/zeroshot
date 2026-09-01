@@ -1,14 +1,15 @@
 # Base image for vibe cluster isolation mode
 # Provides: Node.js, Python, Git, Chromium, Claude CLI, Playwright deps, Infrastructure tools
 #
-# Build: docker build -t vibe-cluster-base vibe/cluster/docker/vibe-cluster/
+# Build: docker build -t zeroshot-cluster-base -f docker/zeroshot-cluster/Dockerfile .
 # Usage: zeroshot run <task> --docker
 
 FROM node:20-slim
 
 # Upgrade npm to fix Arborist isDescendantOf bug (npm 10.x crash on complex peer deps)
 # See: https://github.com/npm/cli/issues/7682
-RUN npm install -g npm@latest
+ARG NPM_VERSION=11.19.1
+RUN npm install -g npm@${NPM_VERSION}
 
 # Version pinning for infrastructure tools
 ARG AWS_CLI_VERSION=2.15.10

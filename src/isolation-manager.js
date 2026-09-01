@@ -23,6 +23,7 @@ const { readRepoSettings } = require('../lib/repo-settings');
 const { getSubagentEventsDir } = require('./subagent-events');
 
 const DEFAULT_WORKTREE_SETUP_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_DOCKER_BUILD_TIMEOUT_MS = 15 * 60 * 1000;
 
 function runSync(command, args, options = {}) {
   const timeout = options.timeout ?? 30000;
@@ -1314,6 +1315,7 @@ class IsolationManager {
           cwd: repoRoot,
           encoding: 'utf8',
           stdio: 'inherit',
+          timeout: DEFAULT_DOCKER_BUILD_TIMEOUT_MS,
         });
 
         console.log(`[IsolationManager] ✓ Image '${image}' built successfully`);
@@ -1349,7 +1351,7 @@ class IsolationManager {
     if (!autoBuild) {
       throw new Error(
         `Docker image '${image}' not found. Build it with:\n` +
-          `  docker build -t ${image} zeroshot/cluster/docker/zeroshot-cluster/`
+          `  docker build -t ${image} -f docker/zeroshot-cluster/Dockerfile .`
       );
     }
 

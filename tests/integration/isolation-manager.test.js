@@ -27,7 +27,7 @@ describe('IsolationManager', function () {
   this.timeout(60000); // Docker operations can be slow
 
   // Skip Docker tests in CI (no Docker image available)
-  // To run locally: docker build -t zeroshot-cluster-base docker/zeroshot-cluster/
+  // To run locally: docker build -t zeroshot-cluster-base -f docker/zeroshot-cluster/Dockerfile .
   before(function () {
     if (process.env.CI) {
       this.skip();
@@ -207,7 +207,10 @@ describe('IsolationManager', function () {
       const result = await manager.execInContainer(testClusterId, [
         'sh',
         '-c',
-        `adduser -D -u 1000 telemetry && su telemetry -s /bin/sh -c "printf '%s\\n' '${JSON.stringify(event)}' >> '${eventsFile}'"`,
+        `adduser -D -u 1000 telemetry && su telemetry -s /bin/sh -c 'printf "%s\\n" "$1" >> "$2"' telemetry-event-write "$1" "$2"`,
+        'telemetry-event-write',
+        JSON.stringify(event),
+        eventsFile,
       ]);
       assert.strictEqual(result.code, 0, result.stderr);
 

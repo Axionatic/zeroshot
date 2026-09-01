@@ -155,7 +155,7 @@ describe('Orchestrator Isolation Mode Integration', function () {
 
   before(function () {
     // Skip isolation tests in CI (no Docker image available)
-    // To run locally: docker build -t zeroshot-cluster-base docker/zeroshot-cluster/
+    // To run locally: docker build -t zeroshot-cluster-base -f docker/zeroshot-cluster/Dockerfile .
     if (process.env.CI) {
       this.skip();
       return;
@@ -271,7 +271,7 @@ async function runContainerCreationTest() {
 async function runPreserveWorkspaceOnStopTest() {
   mockRunner.when('worker').returns('{"done": true}');
 
-  const result = await startIsolatedCluster(simpleConfig, 'Test stop cleanup');
+  const result = await startIsolatedCluster(resumeTestConfig, 'Test stop cleanup');
 
   const clusterId = result.id;
   const cluster = orchestrator.getCluster(clusterId);
