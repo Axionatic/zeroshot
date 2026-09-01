@@ -677,7 +677,7 @@ describe('isolated Codex terminal settlement', function () {
     assert.strictEqual(agent.currentTask, null);
   });
 
-  for (const terminalStatus of ['killed', 'stale (process died)']) {
+  for (const terminalStatus of ['killed']) {
     it(`settles isolated tasks reporting ${terminalStatus}`, async () => {
       const probe = createObserverProbe();
       const tail = createTailProbe();
@@ -717,6 +717,80 @@ describe('isolated Codex terminal settlement', function () {
       assert.strictEqual(agent.currentTask, null);
     });
   }
+
+  it('keeps polling through a transient stale status with no output', async () => {
+    const probe = createObserverProbe();
+    const tail = createTailProbe();
+    let statusCalls = 0;
+    const manager = {
+      spawnInContainer: () => tail.process,
+      execInContainer(_receivedClusterId, command) {
+        const shell = command[2];
+        if (shell.includes('get-log-path')) {
+          return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
+        }
+        if (shell.includes('zeroshot status')) {
+          statusCalls++;
+          if (statusCalls === 2) {
+            tail.process.stdout.emit('data', Buffer.from('{"type":"result"}\n'));
+          }
+          return Promise.resolve({
+            code: 0,
+            stdout: `Status: ${statusCalls === 1 ? 'stale (process died)' : 'completed'}\n`,
+            stderr: '',
+          });
+        }
+        return Promise.resolve({ code: 0, stdout: '', stderr: '' });
+      },
+    };
+    const { agent } = createCodexAgent(manager);
+
+    const outcome = await followClaudeTaskLogsIsolated(
+      agent,
+      'task-transient-stale',
+      observerOptions(probe)
+    );
+
+    assert.strictEqual(outcome.success, true);
+    assert.strictEqual(statusCalls, 2);
+    assert.strictEqual(agent.currentTask, null);
+  });
+
+  it('returns a failed result without parsing empty output for killed tasks', async () => {
+    const probe = createObserverProbe();
+    const tail = createTailProbe();
+    let parseCalls = 0;
+    const manager = {
+      spawnInContainer: () => tail.process,
+      execInContainer(_receivedClusterId, command) {
+        const shell = command[2];
+        if (shell.includes('get-log-path')) {
+          return Promise.resolve({ code: 0, stdout: '/tmp/task.jsonl\n', stderr: '' });
+        }
+        if (shell.includes('zeroshot status')) {
+          return Promise.resolve({ code: 0, stdout: 'Status: killed\n', stderr: '' });
+        }
+        return Promise.resolve({ code: 0, stdout: '', stderr: '' });
+      },
+    };
+    const { agent } = createCodexAgent(manager, {
+      _parseResultOutput: () => {
+        parseCalls++;
+        throw new Error('Task execution failed - no output');
+      },
+    });
+
+    const outcome = await followClaudeTaskLogsIsolated(
+      agent,
+      'task-killed-empty',
+      observerOptions(probe)
+    );
+
+    assert.strictEqual(outcome.success, false);
+    assert.strictEqual(parseCalls, 0);
+    assert.match(outcome.error, /no output/i);
+    assert.strictEqual(agent.currentTask, null);
+  });
 
   it('recognizes the CLI missing-ID result as terminal not-found', async () => {
     const probe = createObserverProbe();

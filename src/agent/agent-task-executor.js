@@ -2226,6 +2226,12 @@ async function checkIsolatedStatus({
     return;
   }
 
+  // A task record is created with pid=null before its watcher records the PID,
+  // so an empty stale result can be a startup race rather than task death.
+  if (isStale && !state.fullOutput) {
+    return;
+  }
+
   await new Promise((r) => setTimeout(r, 200));
   await settler.resolve(async () => {
     const success = isStale
@@ -2248,7 +2254,10 @@ async function checkIsolatedStatus({
           },
         })
       : null;
-    const parsedResult = await agent._parseResultOutput(state.fullOutput);
+    const parsedResult =
+      !success && !state.fullOutput.trim()
+        ? null
+        : await agent._parseResultOutput(state.fullOutput);
 
     return {
       success,
