@@ -259,7 +259,7 @@ describe('isolated Codex subagent observer lifecycle', function () {
     );
   });
 
-  it('finalizes telemetry without changing the existing pending parse-error settlement', async () => {
+  it('finalizes telemetry and rejects when isolated result parsing fails', async () => {
     const tailProcess = new EventEmitter();
     tailProcess.stdout = new EventEmitter();
     tailProcess.stderr = new EventEmitter();
@@ -314,12 +314,12 @@ describe('isolated Codex subagent observer lifecycle', function () {
     const outcome = await Promise.race([
       taskPromise.then(
         () => 'resolved',
-        () => 'rejected'
+        (error) => `rejected: ${error.message}`
       ),
       new Promise((resolve) => setTimeout(() => resolve('pending'), 20)),
     ]);
 
-    assert.strictEqual(outcome, 'pending');
+    assert.strictEqual(outcome, 'rejected: invalid Codex result');
 
     const events = fs
       .readFileSync(eventsFile, 'utf8')
@@ -413,7 +413,7 @@ describe('isolated Codex setup settlement', function () {
     assert.strictEqual(agent.currentTask, null);
   });
 
-  it('installs provider-neutral kill handling while log lookup is pending', async () => {
+  it('enforces the agent timeout while log lookup is pending', async () => {
     const probe = createObserverProbe();
     let lookupStarted = false;
     const manager = {
@@ -436,14 +436,17 @@ describe('isolated Codex setup settlement', function () {
     const outcome = await Promise.race([
       resultPromise.then(
         () => 'resolved',
-        () => 'rejected'
+        (error) => `rejected: ${error.message}`
       ),
       new Promise((resolve) => setTimeout(() => resolve('pending'), 40)),
     ]);
 
     assert.strictEqual(hasCustomKill, true);
-    assert.strictEqual(outcome, 'pending');
-    assert.strictEqual(probe.finishCount, 0);
+    assert.strictEqual(
+      outcome,
+      'rejected: Task task-pending-log-path timeout after 20ms (isolated mode)'
+    );
+    assert.strictEqual(probe.finishCount, 1);
   });
 });
 
@@ -599,7 +602,7 @@ describe('isolated Codex terminal settlement', function () {
     assert.strictEqual(agent.currentTask, null);
   });
 
-  it('keeps retrying status errors until the existing provider-neutral timeout', async () => {
+  it('rejects after consecutive isolated status transport failures', async () => {
     const probe = createObserverProbe();
     const tail = createTailProbe();
     const finalOutput = [
@@ -622,14 +625,21 @@ describe('isolated Codex terminal settlement', function () {
         return Promise.resolve({ code: 0, stdout: finalOutput, stderr: '' });
       },
     };
-    const { agent, publishedLines } = createCodexAgent(manager, { timeout: 45 });
+    const { agent, publishedLines } = createCodexAgent(manager);
 
-    await assert.rejects(
-      () => followClaudeTaskLogsIsolated(agent, 'task-status-exhaustion', observerOptions(probe)),
-      /timeout after 45ms/
+    const outcome = await Promise.race([
+      followClaudeTaskLogsIsolated(agent, 'task-status-exhaustion', observerOptions(probe)).then(
+        () => 'resolved',
+        (error) => `rejected: ${error.message}`
+      ),
+      new Promise((resolve) => setTimeout(() => resolve('pending'), 50)),
+    ]);
+
+    assert.strictEqual(
+      outcome,
+      'rejected: Isolated status check failed 2 consecutive times for task task-status-exhaustion: isolated status unavailable'
     );
-
-    assert.ok(statusCalls > 2);
+    assert.strictEqual(statusCalls, 2);
     assert.strictEqual(probe.finishCount, 1);
     assert.deepStrictEqual(probe.sequence, ['finish']);
     assert.deepStrictEqual(publishedLines, []);

@@ -7,6 +7,17 @@ const TERMINAL_AGENT_STATES = new Set([
   'shutdown',
   'not_found',
 ]);
+const MAX_DESCRIPTION_LENGTH = 80;
+
+function normalizeDescription(value) {
+  if (typeof value !== 'string') return 'subagent';
+  const withoutControls = Array.from(value, (character) => {
+    const codePoint = character.codePointAt(0);
+    return codePoint <= 31 || (codePoint >= 127 && codePoint <= 159) ? ' ' : character;
+  }).join('');
+  const description = withoutControls.replace(/\s+/g, ' ').trim();
+  return description.slice(0, MAX_DESCRIPTION_LENGTH) || 'subagent';
+}
 
 function getAgentState(value) {
   if (typeof value === 'string') return value;
@@ -83,7 +94,7 @@ function createCodexSubagentObserver({ eventsFile, now = Date.now }) {
     ) {
       return;
     }
-    const description = typeof item.prompt === 'string' && item.prompt ? item.prompt : 'subagent';
+    const description = normalizeDescription(item.prompt);
     for (const childId of item.receiver_thread_ids) {
       if (typeof childId === 'string' && childId) startChild(childId, description);
     }

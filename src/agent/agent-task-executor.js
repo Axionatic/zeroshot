@@ -479,7 +479,7 @@ function ensureAskUserQuestionHook(targetClaudeDir = null) {
 
   // Ensure hooks structure exists. A hand-edited settings.json can hold any
   // shape here, and a throw would abort an otherwise healthy agent run.
-  if (!settings.hooks || typeof settings.hooks !== 'object') {
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
     settings.hooks = {};
   }
   if (!Array.isArray(settings.hooks.PreToolUse)) {
@@ -567,7 +567,7 @@ function ensureDangerousGitHook(targetClaudeDir = null) {
 
   // Ensure hooks structure exists. A hand-edited settings.json can hold any
   // shape here, and a throw would abort an otherwise healthy agent run.
-  if (!settings.hooks || typeof settings.hooks !== 'object') {
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
     settings.hooks = {};
   }
   if (!Array.isArray(settings.hooks.PreToolUse)) {
@@ -633,61 +633,69 @@ function ensureSubagentTrackingHook(targetClaudeDir = null) {
     return;
   }
 
-  // Ensure hooks directory exists
-  if (!fs.existsSync(hooksDir)) {
-    fs.mkdirSync(hooksDir, { recursive: true });
-  }
+  try {
+    // Ensure hooks directory exists
+    if (!fs.existsSync(hooksDir)) {
+      fs.mkdirSync(hooksDir, { recursive: true });
+    }
 
-  // Always copy to ensure latest version
-  fs.copyFileSync(hookScriptSrc, hookScriptDst);
-  fs.chmodSync(hookScriptDst, 0o755);
+    // Always copy to ensure latest version
+    fs.copyFileSync(hookScriptSrc, hookScriptDst);
+    fs.chmodSync(hookScriptDst, 0o755);
 
-  // Read existing settings or create new
-  let settings = {};
-  if (fs.existsSync(settingsPath)) {
-    try {
-      settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-    } catch (e) {
-      console.warn(`[AgentTaskExecutor] Could not parse settings.json, creating new: ${e.message}`);
+    // Read existing settings or create new
+    let settings = {};
+    if (fs.existsSync(settingsPath)) {
+      try {
+        settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+      } catch (e) {
+        console.warn(
+          `[AgentTaskExecutor] Could not parse settings.json, creating new: ${e.message}`
+        );
+        settings = {};
+      }
+    }
+
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
       settings = {};
     }
-  }
 
-  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
-    settings = {};
-  }
-
-  // Ensure hooks structure exists. A hand-edited settings.json can hold any
-  // shape here, and a throw would abort an otherwise healthy agent run.
-  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
-    settings.hooks = {};
-  }
-
-  // Tracking needs both ends of the subagent lifecycle to render a live tree.
-  let changed = false;
-  for (const event of ['SubagentStart', 'SubagentStop']) {
-    if (!Array.isArray(settings.hooks[event])) {
-      settings.hooks[event] = [];
+    // Ensure hooks structure exists. A hand-edited settings.json can hold any
+    // shape here, and a throw would abort an otherwise healthy agent run.
+    if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
+      settings.hooks = {};
     }
-    const hasHook = settings.hooks[event].some((entry) =>
-      entry?.hooks?.some?.((h) => h?.command && h.command.includes(hookScriptName))
+
+    // Tracking needs both ends of the subagent lifecycle to render a live tree.
+    let changed = false;
+    for (const event of ['SubagentStart', 'SubagentStop']) {
+      if (!Array.isArray(settings.hooks[event])) {
+        settings.hooks[event] = [];
+      }
+      const hasHook = settings.hooks[event].some((entry) =>
+        entry?.hooks?.some?.((h) => h?.command && h.command.includes(hookScriptName))
+      );
+      if (!hasHook) {
+        settings.hooks[event].push({
+          hooks: [
+            {
+              type: 'command',
+              command: hookScriptDst,
+            },
+          ],
+        });
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+      console.log(`[AgentTaskExecutor] Installed subagent tracking hook in ${settingsPath}`);
+    }
+  } catch (error) {
+    console.warn(
+      `[AgentTaskExecutor] Could not install optional subagent tracking hook: ${error.message}`
     );
-    if (!hasHook) {
-      settings.hooks[event].push({
-        hooks: [
-          {
-            type: 'command',
-            command: hookScriptDst,
-          },
-        ],
-      });
-      changed = true;
-    }
-  }
-
-  if (changed) {
-    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-    console.log(`[AgentTaskExecutor] Installed subagent tracking hook in ${settingsPath}`);
   }
 
   subagentTrackingHookInstalledDirs.add(userClaudeDir);
@@ -1883,6 +1891,7 @@ function createIsolatedLogState() {
     fullOutput: '',
     tailProcess: null,
     statusCheckInterval: null,
+    statusFailureCount: 0,
     timeoutHandle: null,
     lineBuffer: '',
     logFilePath: null,
@@ -2072,7 +2081,11 @@ function createIsolatedSettler({ agent, taskId, providerName, state, finalize, r
       if (state.settled) return;
       state.settled = true;
       await finalize({ drainOutput: true });
-      resolve(await buildResult());
+      try {
+        resolve(await buildResult());
+      } catch (error) {
+        reject(error);
+      }
     },
     reject: async (error) => {
       if (state.settled) return;
@@ -2166,6 +2179,7 @@ function startIsolatedStatusChecks({
   state,
   settler,
   statusIntervalMs,
+  maxStatusFailures,
 }) {
   state.statusCheckInterval = setInterval(() => {
     checkIsolatedStatus({
@@ -2177,9 +2191,24 @@ function startIsolatedStatusChecks({
       providerName,
       state,
       settler,
-    }).catch((statusErr) => {
-      agent._log(`[${agent.id}] Status check error (will retry): ${statusErr.message}`);
-    });
+    })
+      .then(() => {
+        state.statusFailureCount = 0;
+      })
+      .catch((statusErr) => {
+        state.statusFailureCount++;
+        if (state.statusFailureCount >= maxStatusFailures) {
+          settler
+            .reject(
+              new Error(
+                `Isolated status check failed ${state.statusFailureCount} consecutive times for task ${taskId}: ${statusErr.message}`
+              )
+            )
+            .catch(() => {});
+          return;
+        }
+        agent._log(`[${agent.id}] Status check error (will retry): ${statusErr.message}`);
+      });
   }, statusIntervalMs);
 }
 
@@ -2205,6 +2234,7 @@ function followClaudeTaskLogsIsolated(agent, taskId, options = {}) {
   const providerName = agent._resolveProvider ? agent._resolveProvider() : 'claude';
   const observerFactory = options.observerFactory || createCodexSubagentObserver;
   const statusIntervalMs = options.statusIntervalMs || 2000;
+  const maxStatusFailures = options.maxStatusFailures ?? 3;
 
   return new Promise((resolve, reject) => {
     const state = createIsolatedLogState();
@@ -2246,6 +2276,7 @@ function followClaudeTaskLogsIsolated(agent, taskId, options = {}) {
       kill: (reason) => settler.cancel(reason),
     };
     agent.currentTask = state.taskHandle;
+    installIsolatedTimeout({ agent, taskId, state, settler });
 
     Promise.resolve()
       .then(() => {
@@ -2294,9 +2325,8 @@ function followClaudeTaskLogsIsolated(agent, taskId, options = {}) {
           state,
           settler,
           statusIntervalMs,
+          maxStatusFailures,
         });
-
-        installIsolatedTimeout({ agent, taskId, state, settler });
       })
       .catch((err) => {
         settler.reject(err).catch(() => {});

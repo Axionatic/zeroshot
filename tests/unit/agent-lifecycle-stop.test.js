@@ -66,6 +66,22 @@ describe('agent lifecycle stop', function () {
     assert.strictEqual(killAttempts, 2);
   });
 
+  it('keeps strict stop retry-visible while an untracked execution is still running', async function () {
+    const execution = new Promise(() => {});
+    const agent = createAgent({ currentTaskId: null, _currentExecution: execution });
+
+    await assert.rejects(
+      () => stop(agent, { requireTaskTermination: true, shutdownTimeoutMs: 20 }),
+      /Timed out terminating task/
+    );
+    assert.strictEqual(agent._currentExecution, execution);
+
+    await assert.rejects(
+      () => stop(agent, { requireTaskTermination: true, shutdownTimeoutMs: 20 }),
+      /Timed out terminating task/
+    );
+  });
+
   it('keeps full-cluster stop best-effort when task termination fails', async function () {
     const agent = createAgent({
       _killTask: () => Promise.reject(new Error('container already gone')),

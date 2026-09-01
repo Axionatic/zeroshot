@@ -93,6 +93,36 @@ describe('Codex subagent observer', () => {
     ]);
   });
 
+  it('records a bounded single-line display label without terminal control bytes', () => {
+    const observer = createObserver();
+    const prompt = `Review line one\nline two \u001b]0;owned\u0007 ${'x'.repeat(200)}`;
+    observer.observeLine('{"type":"thread.started","thread_id":"root"}');
+    observer.observeLine(
+      JSON.stringify({
+        type: 'item.completed',
+        item: {
+          type: 'collab_tool_call',
+          tool: 'spawn_agent',
+          status: 'completed',
+          sender_thread_id: 'root',
+          receiver_thread_ids: ['safe-child'],
+          prompt,
+        },
+      })
+    );
+
+    const [event] = readEvents(eventsFile);
+    assert.strictEqual(event.description.includes('\n'), false);
+    assert.strictEqual(
+      Array.from(event.description).some((character) => {
+        const codePoint = character.codePointAt(0);
+        return codePoint <= 31 || (codePoint >= 127 && codePoint <= 159);
+      }),
+      false
+    );
+    assert.ok(event.description.length <= 80);
+  });
+
   it('stops only accepted children whose defensive agents_states are terminal', () => {
     const observer = createObserver();
     observer.observeLine('{"type":"thread.started","thread_id":"root"}');

@@ -152,6 +152,13 @@ describe('ensureSubagentTrackingHook', function () {
     expect(commandsFor(readSettings(claudeDir), 'SubagentStop')).to.have.lengthOf(1);
   });
 
+  it('does not throw when optional tracking hook installation fails', () => {
+    const hooksDir = path.join(claudeDir, 'hooks');
+    fs.mkdirSync(path.join(hooksDir, 'track-subagents.py'), { recursive: true });
+
+    expect(() => ensureSubagentTrackingHook(claudeDir)).to.not.throw();
+  });
+
   // A hand-edited settings.json can hold any shape. Installing hooks is a
   // side errand of spawning an agent - it must never be what kills the run.
   const malformed = {
@@ -206,6 +213,24 @@ describe('ensureAskUserQuestionHook / ensureDangerousGitHook', function () {
     fs.writeFileSync(path.join(claudeDir, 'settings.json'), JSON.stringify({ hooks: 'nope' }));
 
     expect(() => ensureDangerousGitHook(claudeDir)).to.not.throw();
+
+    const commands = commandsFor(readSettings(claudeDir), 'PreToolUse');
+    expect(commands.some((c) => c && c.endsWith('block-dangerous-git.py'))).to.equal(true);
+  });
+
+  it('replaces array-valued hooks before registering the AskUserQuestion blocker', () => {
+    fs.writeFileSync(path.join(claudeDir, 'settings.json'), JSON.stringify({ hooks: [] }));
+
+    ensureAskUserQuestionHook(claudeDir);
+
+    const commands = commandsFor(readSettings(claudeDir), 'PreToolUse');
+    expect(commands.some((c) => c && c.endsWith('block-ask-user-question.py'))).to.equal(true);
+  });
+
+  it('replaces array-valued hooks before registering the dangerous-git blocker', () => {
+    fs.writeFileSync(path.join(claudeDir, 'settings.json'), JSON.stringify({ hooks: [] }));
+
+    ensureDangerousGitHook(claudeDir);
 
     const commands = commandsFor(readSettings(claudeDir), 'PreToolUse');
     expect(commands.some((c) => c && c.endsWith('block-dangerous-git.py'))).to.equal(true);

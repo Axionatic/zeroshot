@@ -154,6 +154,8 @@ function validateAgentIdentity(agent, prefix, seenIds, errors) {
     errors.push(`${prefix}.id is required`);
   } else if (typeof agent.id !== 'string') {
     errors.push(`${prefix}.id must be a string`);
+  } else if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(agent.id)) {
+    errors.push(`${prefix}.id must be a safe identifier without path separators`);
   } else if (seenIds.has(agent.id)) {
     errors.push(`Duplicate agent id: "${agent.id}"`);
   } else {

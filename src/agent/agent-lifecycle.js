@@ -28,7 +28,6 @@ const { findPlatformMismatchReason } = require('./validation-platform');
 const safeExec = require('../lib/safe-exec');
 const path = require('path');
 const { calculateRateLimitDelay, isRateLimitError } = require('./rate-limit-backoff');
-const { killTask } = require('./agent-task-executor');
 
 const DEFAULT_VALIDATOR_IMAGE = 'zeroshot-cluster-base';
 
@@ -207,7 +206,8 @@ function start(agent) {
  */
 async function stop(agent, { requireTaskTermination = false, shutdownTimeoutMs = 5000 } = {}) {
   const hasTrackedTask = !!(agent.currentTask || agent.currentTaskId);
-  if (!agent.running && !(requireTaskTermination && hasTrackedTask)) {
+  const hasPendingExecution = !!agent._currentExecution;
+  if (!agent.running && !(requireTaskTermination && (hasTrackedTask || hasPendingExecution))) {
     return;
   }
 
@@ -256,7 +256,6 @@ async function stop(agent, { requireTaskTermination = false, shutdownTimeoutMs =
       }),
     ]);
     clearTimeout(timeoutHandle);
-    agent._currentExecution = null;
   }
 
   agent._log(`Agent ${agent.id} stopped`);
@@ -997,7 +996,16 @@ async function executeTask(agent, triggeringMessage) {
       sigtermRetryGranted = updated.sigtermRetryGranted;
       noMessagesRetryGranted = updated.noMessagesRetryGranted;
       // Kill orphan task before retry — prevents accumulating zombie processes
-      await killTask(agent);
+      try {
+        await agent._killTask();
+      } catch (killError) {
+        const terminationError = new Error(
+          `Task attempt failed and cleanup could not terminate it: ${killError.message}`
+        );
+        terminationError.cause = killError;
+        await handleFinalFailure(agent, triggeringMessage, terminationError, attempt);
+        return;
+      }
       agent.processPid = null;
 
       const shouldStop = await handleTaskAttemptFailure({

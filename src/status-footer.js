@@ -976,12 +976,12 @@ class StatusFooter {
       this.samplingIntervalId = null;
     }
 
-    // Stop subagent polling and cleanup temp files
+    // Stop subagent polling. The orchestrator owns the shared event directory;
+    // a temporary viewer must not remove files used by a running cluster.
     if (this.subagentPollId) {
       clearInterval(this.subagentPollId);
       this.subagentPollId = null;
     }
-    this.subagentTracker?.cleanup();
 
     // Remove resize listener
     process.stdout.removeListener('resize', this._debouncedResize);

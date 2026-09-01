@@ -31,6 +31,7 @@ const { expect } = require('chai');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { spawn } = require('child_process');
 
 const POLL_TIMEOUT_MS = 15000;
 
@@ -43,6 +44,9 @@ process.env.ZEROSHOT_HOME = homeDir;
 
 let spawnTask;
 let getTask;
+let addTask;
+let killTaskCommand;
+let isProcessRunning;
 let binDir;
 let recordFile;
 let originalPath;
@@ -84,8 +88,9 @@ describe('spawnTask provider commandSpec execution', function () {
   this.timeout(POLL_TIMEOUT_MS + 5000);
 
   before(async () => {
-    ({ spawnTask } = await import('../../task-lib/runner.js'));
-    ({ getTask } = await import('../../task-lib/store.js'));
+    ({ spawnTask, isProcessRunning } = await import('../../task-lib/runner.js'));
+    ({ getTask, addTask } = await import('../../task-lib/store.js'));
+    ({ killTaskCommand } = await import('../../task-lib/commands/kill.js'));
   });
 
   beforeEach(() => {
@@ -157,5 +162,29 @@ describe('spawnTask provider commandSpec execution', function () {
     expect(stored.id).to.equal(task.id);
     expect(stored.fullPrompt).to.equal('persisted prompt');
     expect(stored.provider).to.equal('claude');
+  });
+
+  it('waits for the provider process to exit before reporting a task killed', async () => {
+    const child = spawn(
+      process.execPath,
+      [
+        '-e',
+        "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 200)); setInterval(() => {}, 1000);",
+      ],
+      { stdio: 'ignore' }
+    );
+    const taskId = `kill-wait-${process.pid}-${Date.now()}`;
+
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      addTask({ id: taskId, status: 'running', pid: child.pid });
+
+      await killTaskCommand(taskId);
+
+      expect(isProcessRunning(child.pid)).to.equal(false);
+      expect(getTask(taskId).status).to.equal('killed');
+    } finally {
+      if (isProcessRunning(child.pid)) child.kill('SIGKILL');
+    }
   });
 });

@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { getSubagentEventsDir } = require('./subagent-events');
+const MAX_EVENT_READ_BYTES = 1024 * 1024;
 
 class SubagentTracker {
   /**
@@ -55,10 +56,11 @@ class SubagentTracker {
     const offset = this.offsets.get(filePath) || 0;
     if (stat.size <= offset) return; // No new data
 
+    const readLength = Math.min(stat.size - offset, MAX_EVENT_READ_BYTES);
     let chunk;
     try {
       const fd = fs.openSync(filePath, 'r');
-      const buf = Buffer.alloc(stat.size - offset);
+      const buf = Buffer.alloc(readLength);
       fs.readSync(fd, buf, 0, buf.length, offset);
       fs.closeSync(fd);
       chunk = buf.toString('utf8');
@@ -67,7 +69,12 @@ class SubagentTracker {
     }
 
     const finalNewline = chunk.lastIndexOf('\n');
-    if (finalNewline === -1) return; // Wait for a complete JSONL record.
+    if (finalNewline === -1) {
+      if (readLength === MAX_EVENT_READ_BYTES) {
+        this.offsets.set(filePath, offset + readLength);
+      }
+      return; // Wait for a complete record, or discard one that exceeds the byte bound.
+    }
 
     const completeChunk = chunk.slice(0, finalNewline + 1);
     this.offsets.set(filePath, offset + Buffer.byteLength(completeChunk, 'utf8'));

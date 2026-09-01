@@ -160,6 +160,28 @@ describe('SubagentTracker', () => {
     );
   });
 
+  it('drops an oversized newline-free record without rereading it forever', () => {
+    const tracker = new SubagentTracker(TEST_CLUSTER_ID);
+    const filePath = path.join(BASE_DIR, 'analyst.jsonl');
+    fs.mkdirSync(BASE_DIR, { recursive: true });
+    fs.writeFileSync(filePath, '');
+    fs.truncateSync(filePath, 2 * 1024 * 1024);
+
+    tracker.poll();
+    tracker.poll();
+    assert.strictEqual(tracker.offsets.get(filePath), fs.statSync(filePath).size);
+
+    fs.appendFileSync(
+      filePath,
+      `\n${JSON.stringify({ event: 'start', agent_id: 'sub-1', ts: 1000 })}\n`
+    );
+    tracker.poll();
+    assert.deepStrictEqual(
+      tracker.getActiveSubagents('analyst').map((subagent) => subagent.id),
+      ['sub-1']
+    );
+  });
+
   it('deduplicates duplicate starts for an active parent-child pair', () => {
     const tracker = new SubagentTracker(TEST_CLUSTER_ID);
 

@@ -2,11 +2,19 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+function assertSafePathComponent(value, label) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(value)) {
+    throw new TypeError(`${label} must be a safe path component`);
+  }
+}
+
 function getSubagentEventsDir(clusterId) {
+  assertSafePathComponent(clusterId, 'clusterId');
   return path.join(os.tmpdir(), 'zeroshot-subagents', clusterId);
 }
 
 function getSubagentEventsFile(clusterId, parentAgentId) {
+  assertSafePathComponent(parentAgentId, 'parentAgentId');
   return path.join(getSubagentEventsDir(clusterId), `${parentAgentId}.jsonl`);
 }
 

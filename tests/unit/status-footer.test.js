@@ -1,5 +1,7 @@
 const assert = require('assert');
 const { StatusFooter, AGENT_STATE } = require('../../src/status-footer');
+const fs = require('fs');
+const { getSubagentEventsDir } = require('../../src/subagent-events');
 
 describe('StatusFooter updateAgent', () => {
   it('maps legacy pid to processPid', () => {
@@ -29,5 +31,22 @@ describe('StatusFooter updateAgent', () => {
     const agent = footer.agents.get('worker');
     assert.strictEqual(agent.processPid, 2222);
     assert.strictEqual(agent.pid, 2222);
+  });
+});
+
+describe('StatusFooter subagent event ownership', () => {
+  it('does not delete the cluster event directory when a viewer stops', () => {
+    const clusterId = `footer-owner-${process.pid}-${Date.now()}`;
+    const eventsDir = getSubagentEventsDir(clusterId);
+    fs.mkdirSync(eventsDir, { recursive: true });
+    const footer = new StatusFooter({ enabled: false });
+    footer.setCluster(clusterId);
+
+    try {
+      footer.stop();
+      assert.strictEqual(fs.existsSync(eventsDir), true);
+    } finally {
+      fs.rmSync(eventsDir, { recursive: true, force: true });
+    }
   });
 });

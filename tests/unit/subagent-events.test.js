@@ -22,6 +22,11 @@ describe('subagent event helpers', () => {
     );
   });
 
+  it('rejects telemetry path components that can escape the shared directory', () => {
+    assert.throws(() => getSubagentEventsDir('../cluster'), /safe path component/);
+    assert.throws(() => getSubagentEventsFile('cluster-1', 'parent/child'), /safe path component/);
+  });
+
   it('creates parent directories and appends one JSONL event', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'subagent-events-'));
     const filePath = path.join(root, 'nested', 'events.jsonl');
