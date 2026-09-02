@@ -4,7 +4,7 @@
 
 **Goal:** Restore the code-review, documentation-review, and document-drafting packs as opt-in v6.46 products with bounded truthful artifacts and deterministic atomic output.
 
-**Architecture:** Each pack family is reauthored against upstream template schemas and the closed workflow-operation registry, then accepted independently. A shared artifact declaration and writer implement `--output`; shared fixed batching limits specialist fan-out without modifying provider context settings.
+**Architecture:** Each pack family is reauthored against upstream template schemas and the closed workflow-operation registry, then accepted independently. A shared artifact declaration and writer implement `--output`; fixed prompt-level batching instructions preserve the fork's bounded working style without claiming a runtime semaphore over provider-native subagents.
 
 **Tech Stack:** JSON parameterized templates, Node.js 22, TypeScript/CommonJS, Mocha, upstream template resolver and simulation framework.
 
@@ -12,12 +12,22 @@
 
 ## Global Constraints
 
+- Obey the program plan's serial task admission/handoff contract; no worker may
+  infer cwd or predecessor state from a prior worker's shell.
+
 - Upstream generic workflows remain the default; every restored pack is opt-in.
 - The only typed workflow operations are `review.synthesize`, `document.build_revision_context`, and `document.assemble`.
 - Every pack emits exactly one Markdown artifact and exactly one terminal event.
 - Contested review findings at cap force `NOT_READY`; document cap emits a conspicuous `MAX_ITERATIONS` draft.
-- Keep a conservative fixed batch limit; do not inject `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` and do not implement adaptive concurrency.
+- Keep a conservative fixed batch instruction; test its resolved prompt and do
+  not claim hard runtime enforcement. Do not inject
+  `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` or implement adaptive concurrency.
 - `--output` is accepted only for a fully resolved config declaring one Markdown artifact and is distinct from `--result-file`.
+- `--output` provides crash-safe replacement for the caller-selected path; it
+  is not a sandbox against a concurrently malicious same-UID process replacing
+  ancestor directories. Do not add `lstat`/`realpath` checks that merely narrow
+  but cannot close that race. A stronger threat model requires a separate
+  descriptor-relative/OS-specific design.
 - No live provider run is authorized.
 
 ---
@@ -29,8 +39,13 @@
 - Create: `src/workflow-artifacts.ts`
 - Modify: `src/template-resolver.js`
 - Modify: `src/config-validator.js`
+- Modify: `src/orchestrator.js`
+- Modify: `src/agent/pr-verification.js`
+- Modify: `src/agents/git-pusher-template.js`
 - Modify: `src/template-validation/simulate-random-topology.ts`
 - Test: `tests/unit/workflow-artifact-contract.test.js`
+- Create: `tests/unit/workflow-handoff.test.js`
+- Create: `tests/unit/artifact-handoff-pusher.test.js`
 - Modify: `tests/template-resolver-typed-values.test.js`
 - Modify: `tests/unit/simulate-random-topology.test.js`
 
@@ -39,6 +54,40 @@
 - Produces config declaration `artifacts: [{ id: string, mediaType: 'text/markdown', sourceTopic: string }]`.
 - Produces params `max_iterations: integer >= 1`, `batch_limit: integer >= 1`, `preflight_quality_gate: boolean`.
 - Produces `resolveSingleMarkdownArtifact(config): WorkflowArtifactDeclaration | null`.
+- Produces `validateArtifactWorkflowConfig(resolvedConfig, registry):
+ValidatedArtifactBinding` before provider startup. It requires exactly one
+  reachable final operation for the sealed family, declaration `sourceTopic ===
+descriptor.successTopic`, policy `after_artifact_commit`, and no competing
+  producer. The immutable binding carries artifact declaration, final operation
+  ID, descriptor revision, and success topic into `WorkflowRuntime` and the
+  writer; simulation models the registry-to-topic producer edge.
+- Produces immutable host-owned `WorkflowInstanceDescriptor` with workflow ID,
+  family, resolved-config revision, and sorted expected analyst/validator IDs.
+- Direct packs atomically create it in `sealed` state during initial resolution.
+  A conductor entry creates an `unfinalized` descriptor containing only run
+  identity, family, and the root artifact contract; after `load_config`
+  validates the selected resolved config, the host seals it exactly once with
+  descriptor revision, resolved-config digest, and sorted analyst/validator IDs
+  before adding loaded agents or replaying input. Persist both descriptor states
+  in ledger `workflow_state`; cluster JSON may carry only a derived summary and
+  is never authoritative.
+  A second/different seal or later topology mutation fails closed, and no
+  workflow operation may run while the descriptor is unfinalized.
+- Produces `installWorkflowRuntime(sealedDescriptor, dependencies)`. Direct
+  packs seal and install it before product agents start. Conductors may run only
+  the bootstrap while unfinalized; `_opLoadConfig` seals and installs the
+  runtime before loaded agents or republished input. The runtime registers its
+  durable catch-up subscription before any product trigger can fire. Generic
+  configs never install this opt-in service or terminal coordinator.
+- Produces `hydrateWorkflowRuntimeFromState()`, called immediately after ledger
+  and message-bus creation and before rebuilding/subscribing/starting agents or
+  replaying outbox rows. It rehydrates descriptor, terminal/progress state,
+  artifact binding/path/cursor, and handoff from the one ledger authority; a
+  mismatching cluster-JSON summary fails closed rather than overwriting it.
+- Every selectable conductor and fixed-tier entry config declares the same
+  immutable artifact contract as its dynamically loaded base. Dynamic loading
+  validates equality; it must not silently discard or replace the entry
+  contract.
 
 - [ ] **Step 1: Add failing declaration validation tests**
 
@@ -62,6 +111,13 @@ for (const artifacts of [[], [{ mediaType: 'text/plain' }], [{}, {}]]) {
 ```
 
 Add template-param tests rejecting zero, floats, strings, and unknown fields.
+Add an entrypoint matrix for every conductor and fixed tier covering direct
+`--config`, `config list/show`, dynamic `load_config`, packaging, and `--output`.
+Use one canonical `preflight_quality_gate` name; retain `quality_gate` only as a
+deprecated alias with deterministic conflict rejection.
+Add wrong-family source-topic, absent/multiple final operation, competing
+producer, and wrong terminal-policy failures across direct/conductor entrypoints
+and randomized topology.
 
 - [ ] **Step 2: Run tests and verify missing contract**
 
@@ -80,17 +136,69 @@ export interface WorkflowArtifactDeclaration {
   readonly mediaType: 'text/markdown';
   readonly sourceTopic: 'REVIEW_ARTIFACT_READY' | 'DOCUMENT_ARTIFACT_READY';
 }
+
+export type WorkflowInstanceDescriptor =
+  | {
+      readonly state: 'unfinalized';
+      readonly id: string;
+      readonly family: 'code-review' | 'documentation-review' | 'document-draft';
+      readonly artifact: WorkflowArtifactDeclaration;
+    }
+  | {
+      readonly state: 'sealed';
+      readonly id: string;
+      readonly family: 'code-review' | 'documentation-review' | 'document-draft';
+      readonly artifact: WorkflowArtifactDeclaration;
+      readonly descriptorRevision: string;
+      readonly configRevision: string;
+      readonly expectedAnalystIds: readonly string[];
+      readonly expectedValidatorIds: readonly string[];
+    };
 ```
 
 Require exactly one declaration only when the caller requests output; generic
 templates without `artifacts` remain valid. Deep simulation must prove the
 declared source topic has one reachable producer and reaches one terminal path.
+At runtime `_opLoadConfig` compares any loaded declaration with the immutable
+root declaration before adding agents; mismatch fails before the loaded agents
+can run, then seals the descriptor in the same admission transition. It does not
+replace run-level artifact state.
+
+Classify the root as an artifact workflow before upstream applies initial
+`--pr`/completion configuration. Gate generic completion-agent construction at
+both initial start and dynamic load. Persist a host-owned one-shot handoff
+descriptor. Suppress both initial and dynamic generic pusher injection. When
+`--pr` or `--ship` is requested, install one initially idle protected pusher
+subscribed to host-owned `ARTIFACT_HANDOFF_READY` before that event can be
+inserted. After artifact acceptance/commit, atomically enter durable
+`HANDOFF_PENDING` with handoff key, mode, artifact receipt, validation cursor,
+and deterministic ready-message ID; do not terminalize. The ready predicate
+reads that stored handoff and bounded ledger evidence, never a fresh
+`VALIDATION_RESULT`/`IMPLEMENTATION_READY`.
+
+The terminal coordinator remains the sole publisher. In `HANDOFF_PENDING`, only
+the authorized pusher's verified PR/merge result may call `completeHandoff`;
+route artifact-workflow success/failure in `pr-verification.js` through that
+facade rather than direct terminal publication. Early `stop_cluster`/validation
+success requests cannot terminalize. Test fixed/conductor `--pr` and `--ship`,
+pre-accept races, pusher failure/cancel, duplicate release, and resume between
+acceptance, pusher subscription, ready insertion, and verification. Generic
+configs keep upstream behavior unchanged.
+
+Implement a distinct `generateArtifactHandoffPusher(binding)` path in
+`src/agents/git-pusher-template.js`. Its sole trigger is
+`ARTIFACT_HANDOFF_READY`; it carries and validates the provenance-bound handoff
+key/artifact receipt, and has no `publishAfter: CLUSTER_COMPLETE` or raw terminal
+action. `pr-verification.js` may only call
+`terminalCoordinator.completeHandoff(handoffKey, verifiedReceipt)` or the
+coordinator failure path. Preserve and regression-test the ordinary upstream
+generator behavior for generic configs.
 
 - [ ] **Step 4: Run the shared contract suite**
 
 ```bash
 npm run build:legacy-runtime
-node tests/run-tests.js tests/unit/workflow-artifact-contract.test.js tests/template-resolver-typed-values.test.js tests/unit/simulate-random-topology.test.js tests/unit/template-validation-deep.test.js
+node tests/run-tests.js tests/unit/workflow-artifact-contract.test.js tests/unit/workflow-handoff.test.js tests/unit/artifact-handoff-pusher.test.js tests/template-resolver-typed-values.test.js tests/unit/simulate-random-topology.test.js tests/unit/template-validation-deep.test.js
 npm run typecheck:legacy-runtime
 npm run lint
 ```
@@ -100,7 +208,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit shared pack contracts**
 
 ```bash
-git add src/workflow-artifacts.ts src/workflow-artifacts.js src/template-resolver.js src/config-validator.js src/template-validation/simulate-random-topology.ts src/template-validation/simulate-random-topology.js tests/unit/workflow-artifact-contract.test.js tests/template-resolver-typed-values.test.js tests/unit/simulate-random-topology.test.js
+git add src/workflow-artifacts.ts src/workflow-artifacts.js src/template-resolver.js src/config-validator.js src/orchestrator.js src/agent/pr-verification.js src/agents/git-pusher-template.js src/template-validation/simulate-random-topology.ts src/template-validation/simulate-random-topology.js tests/unit/workflow-artifact-contract.test.js tests/unit/workflow-handoff.test.js tests/unit/artifact-handoff-pusher.test.js tests/template-resolver-typed-values.test.js tests/unit/simulate-random-topology.test.js
 git commit -m "feat: define workflow artifact and pack contracts"
 ```
 
@@ -126,12 +234,15 @@ git commit -m "feat: define workflow artifact and pack contracts"
 
 Resolve the base with `{ max_iterations: 3, batch_limit: 2,
 preflight_quality_gate: true }`. Assert Bell/Book/Candle analysts are present,
-no more than two can launch in one batch, all candidate/validation topics are
-consumed, and the synthesizer trigger is exactly:
+the resolved prompt instructs the orchestrating LLM to issue at most two
+specialist assignments per batch, all candidate, analyst-complete, and
+validation topics are consumed by the host round coordinator, and the single
+synthesizer invokes the operation only from the coordinator-owned ready topic
+using exactly:
 
 ```json
 {
-  "topic": "REVIEW_SYNTHESIS_REQUESTED",
+  "topic": "REVIEW_ROUND_READY",
   "action": "execute_workflow_operation",
   "operation": "review.synthesize"
 }
@@ -140,9 +251,19 @@ consumed, and the synthesizer trigger is exactly:
 Assert no trigger has `command`, `cwd`, `env`, `onSuccess`, or
 `contentFromOutput`.
 
+Each expected analyst emits a schema-checked round-complete envelope, including
+an empty finding set. The provider-free `ReviewRoundCoordinator` from the
+operations plan consumes progress serially, waits for the sealed analyst and
+validator sets, freezes the snapshot, and compare-and-set claims one
+round-scoped execution. It emits `REVIEW_ROUND_READY` exactly once. The
+synthesizer is the only consumer allowed to invoke `review.synthesize`; it has
+no `pending` path and uses the claimed execution key. Duplicate/late progress
+messages reuse the stored disposition, so only one invocation can emit the
+artifact.
+
 - [ ] **Step 2: Add terminal scenario tests**
 
-Use token-free fixtures for: zero findings, all confirmed non-blocking,
+Use token-free fixtures for: zero findings from every expected analyst, all confirmed non-blocking,
 blocking confirmed, contested at iteration 3, withdrawn, validator retry, one
 analyst failure, synthesis failure, and simultaneous cap/cancellation. Assert
 one terminal topic and the exact `READY`/`NOT_READY` classification.
@@ -158,9 +279,15 @@ Expected: FAIL on missing templates.
 - [ ] **Step 4: Reauthor the base against v6.46**
 
 Use fork `cluster-templates/base-templates/code-review-workflow.json` only as
-behavioral evidence. Define explicit candidate and validator schemas, stable
-finding IDs, fixed batching, bounded analyst rounds, and one synthesis request.
-Declare:
+behavioral evidence. Consume the shared versioned review envelope verbatim and
+define only the code-review payload variant. Include review/round IDs, finding
+revision, validator identity, causation/idempotency keys, and snapshot sequence.
+Host publishing code stamps workflow-instance identity and the authoritative
+validator set; any model-emitted copy is checked only as a redundant assertion.
+Use stable finding IDs, fixed prompt batching,
+bounded analyst rounds, and one serialized synthesis transition. Declare the
+same immutable artifact object in the base, Bell, Book, Candle, and conductor
+entry configs:
 
 ```json
 "artifacts": [
@@ -222,7 +349,8 @@ git commit -m "feat: restore bounded code review workflows"
 Assert Trace, Vector, and Axiom are distinct reachable specialists; their
 schemas include location/evidence/remediation fields suited to documents; the
 family declares artifact ID `documentation-review`; and fixed batch/max
-parameters resolve as typed integers.
+parameters resolve as typed integers. The base, Trace, Vector, Axiom, and
+conductor entry configs must carry the same immutable artifact declaration.
 
 - [ ] **Step 2: Add bounded result scenarios**
 
@@ -241,9 +369,11 @@ Expected: FAIL.
 
 - [ ] **Step 4: Reauthor the family**
 
-Use the prior fork family for specialist intent only. Follow current upstream
-provider names, model-level floors, context strategies, schema rules, and
-terminal lifecycle. Use only the closed `review.synthesize` operation.
+Use the prior fork family for specialist intent only. Consume the same shared
+review envelope and aggregation table while defining a distinct documentation
+payload variant. Follow current upstream provider names, model-level floors,
+context strategies, schema rules, and terminal lifecycle. Use only the closed
+`review.synthesize` operation and the same serialized coordinator protocol.
 
 - [ ] **Step 5: Validate and simulate**
 
@@ -275,7 +405,9 @@ git commit -m "feat: restore bounded documentation review workflows"
 
 **Interfaces:**
 
-- Produces `DRAFT_READY`, `VALIDATION_RESULT`, `REVISION_CONTEXT`, and `DOCUMENT_ARTIFACT_READY`.
+- Produces `DRAFT_READY`, `VALIDATION_RESULT`, host-owned
+  `DOCUMENT_REVISION_READY`/`DOCUMENT_ASSEMBLY_READY`, `REVISION_CONTEXT`, and
+  `DOCUMENT_ARTIFACT_READY`.
 - Uses operations `document.build_revision_context` and `document.assemble`.
 
 - [ ] **Step 1: Write base/delta schema tests**
@@ -295,8 +427,20 @@ assert.ok(message.data.delta);
 assert.ok(Array.isArray(message.data.delta.revisedSections));
 ```
 
-Reject a missing base, full-document later iteration, duplicate section IDs,
-unknown replacement anchors, or unbounded revision parameters.
+Require every message to carry `documentId`, `revision`, exact `baseRevision`,
+`validationRound`, `causationMessageId`, `idempotencyKey`, and
+`throughSequence`. Reject a missing base, full-document later iteration,
+duplicate section IDs, unknown replacement anchors, a delta not targeting the
+current revision, stale/future validation rounds, duplicate idempotency keys,
+or unbounded revision parameters.
+
+Assert templates cannot invoke either document operation from raw
+`VALIDATION_RESULT`. The installed `WorkflowRuntime` deterministically waits for
+the sealed validator quorum and routes only its durable ready topics:
+`DOCUMENT_REVISION_READY -> document.build_revision_context` below cap when
+revision is required, and `DOCUMENT_ASSEMBLY_READY -> document.assemble` for
+unanimous approval or cap. Runtime claim validation rejects model-spoofed ready
+topics.
 
 - [ ] **Step 2: Add operation routing and terminal tests**
 
@@ -304,6 +448,8 @@ Assert non-unanimous validation below cap triggers only
 `document.build_revision_context`; unanimous approval or the cap triggers only
 `document.assemble`. Cover all-approved, approve-with-notes, revise, reject,
 missing section, retry duplicate, max cap, assembly error, and cancellation.
+Pin expected validators, `APPROVE_WITH_NOTES`, missing/failed-validator
+behavior, and resume replay in the routing truth table.
 
 - [ ] **Step 3: Run tests and verify absence**
 
@@ -318,7 +464,8 @@ Expected: FAIL on missing family.
 Use Facet, Lens, and Prism as the fixed perspectives. Define explicit document,
 delta, section-review, and validation schemas. Declare artifact ID
 `document-draft`, media type `text/markdown`, and source topic
-`DOCUMENT_ARTIFACT_READY`. Keep batching fixed and require terse assignment
+`DOCUMENT_ARTIFACT_READY` on the base, Facet, Lens, Prism, and conductor entry
+configs. Keep batching fixed and require terse assignment
 titles without relying on telemetry.
 
 - [ ] **Step 5: Prove truthful cap rendering**
@@ -345,9 +492,9 @@ git commit -m "feat: restore bounded document drafting workflows"
 - Create: `src/workflow-artifact-output.ts`
 - Modify: `cli/index.js`
 - Modify: `src/legacy-lib/start-cluster-run-options.ts`
+- Modify: `src/legacy-lib/clusters-registry.ts`
 - Modify: `src/legacy-lib/start-cluster.ts`
 - Modify: `src/orchestrator.js`
-- Modify: `task-lib/runner.js`
 - Create: `tests/unit/workflow-artifact-output.test.js`
 - Create: `tests/unit/cli-output-file.test.js`
 - Modify: `tests/unit/detached-startup-contract.test.js`
@@ -357,8 +504,14 @@ git commit -m "feat: restore bounded document drafting workflows"
 
 **Interfaces:**
 
-- Produces `resolveArtifactOutputPath(input, invocationCwd): string` and `commitMarkdownArtifact({ destination, markdown }): Promise<void>`.
-- Persists `artifactOutputPath` as an absolute run option; consumes the configured artifact's source topic.
+- Produces `resolveArtifactOutputPath(input, invocationCwd): string` and an
+  idempotent host-side `commitMarkdownArtifact({ destination, markdown,
+checksum, artifactSequence })`.
+- Persists `artifactOutputPath`, artifact binding, phase, and cursor in ledger
+  `workflow_state` within the same state/message transaction; cluster state may
+  expose only a derived diagnostic summary.
+- Consumes the configured artifact's source topic through a replayable
+  READY/COMMITTED protocol.
 
 - [ ] **Step 1: Add path resolution tests**
 
@@ -386,8 +539,17 @@ Markdown; every failure leaves `old` unchanged and no owned temp remains.
 
 Assert the absolute destination resolved from original invocation cwd survives
 foreground, detached daemon serialization, resume, worktree cwd change, and
-Docker host/container path translation. Only the host-side owner commits the
-final file.
+Docker execution without being translated or sent to provider task runners.
+Only the host-side orchestrator owner commits the final file. Add dynamic-load
+tests proving no generic completion agent can terminalize an artifact workflow.
+
+Add crash-window/resume cases: before temp write, after rename but before the
+commit receipt, after the receipt but before terminal publication, and during
+shutdown. Replaying the same READY checksum is idempotent; a mismatched checksum
+for the same artifact sequence fails closed.
+Add resume immediately after descriptor sealing, artifact READY, and
+`HANDOFF_PENDING`; assert runtime hydration completes before any agent rebuild
+or outbox delivery and uses the same path/binding/cursor.
 
 - [ ] **Step 4: Run tests and verify missing behavior**
 
@@ -411,8 +573,19 @@ export function resolveArtifactOutputPath(input: string, invocationCwd: string):
 
 For commit, create parents, open a sibling temp with `wx`/`0o600`, write the
 exact UTF-8 Markdown, sync/close, rename, and clean only that owned temp on
-failure. Subscribe once to the declared source topic and commit only after the
-successful terminal result is accepted by the exactly-once boundary.
+failure. The configured `*_ARTIFACT_READY` operation event is nonterminal and
+contains Markdown, checksum, artifact identity, and durable sequence. The
+awaited host owner first durably calls the cluster coordinator's
+`markArtifactReady`. Without `--output`, it validates exactly one declared
+artifact and persists `ARTIFACT_ACCEPTED`.
+With `--output`, it commits the file, persists `ARTIFACT_COMMITTED`, then asks
+the coordinator to advance. With no delivery request, the accepted/committed
+transition asks it to succeed. With `--pr`/`--ship`, it instead atomically calls
+`enterHandoffPending` and relies on the already-subscribed protected pusher;
+artifact ownership never publishes success in that mode. Commit failure asks
+the same coordinator for the sole failure terminal. Resume rehydrates phase and scans through
+the stored cursor, replaying READY lacking ACCEPTED/COMMITTED. Cover both
+branches and every crash window.
 
 - [ ] **Step 6: Add CLI and persisted run option**
 
@@ -441,7 +614,7 @@ Expected: PASS.
 - [ ] **Step 8: Commit deterministic output**
 
 ```bash
-git add src/workflow-artifact-output.ts src/workflow-artifact-output.js cli/index.js src/legacy-lib/start-cluster-run-options.ts src/legacy-lib/start-cluster.ts src/orchestrator.js task-lib/runner.js lib task-lib tests/unit/workflow-artifact-output.test.js tests/unit/cli-output-file.test.js tests/unit/detached-startup-contract.test.js tests/unit/cli-resume-loads-clusters.test.js tests/integration/orchestrator-worktree.test.js tests/unit/docker-config-contract.test.js
+git add src/workflow-artifact-output.ts src/workflow-artifact-output.js cli/index.js src/legacy-lib/start-cluster-run-options.ts src/legacy-lib/clusters-registry.ts src/legacy-lib/start-cluster.ts src/orchestrator.js lib tests/unit/workflow-artifact-output.test.js tests/unit/cli-output-file.test.js tests/unit/detached-startup-contract.test.js tests/unit/cli-resume-loads-clusters.test.js tests/integration/orchestrator-worktree.test.js tests/unit/docker-config-contract.test.js
 git commit -m "feat: add atomic workflow artifact output"
 ```
 
@@ -459,13 +632,18 @@ Review generated changes before committing.
 **Interfaces:**
 
 - Consumes: resolved `batch_limit`.
-- Produces: at most `batch_limit` simultaneous specialists; preserves a user-supplied autocompact environment value without creating one.
+- Produces: explicit resolved instructions to issue at most `batch_limit`
+  provider-native specialist assignments, wait for that batch, merge results,
+  then issue the next batch. This is an LLM process contract, not a hard runtime
+  concurrency guarantee. Preserves a user-supplied autocompact environment
+  value without creating one.
 
 - [ ] **Step 1: Add batching and environment regressions**
 
 ```js
-const launches = simulateSpecialistLaunches({ specialists: 7, batchLimit: 2 });
-assert.ok(Math.max(...launches.map((entry) => entry.concurrent)) <= 2);
+const prompt = resolvePackPrompt({ specialists: 7, batchLimit: 2 });
+assert.match(prompt, /at most 2/i);
+assert.match(prompt, /wait.*merge.*next batch/is);
 
 const env = buildProviderEnv({ CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '73' });
 assert.strictEqual(env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE, '73');
@@ -476,13 +654,15 @@ assert.strictEqual(Object.hasOwn(buildProviderEnv({}), 'CLAUDE_AUTOCOMPACT_PCT_O
 
 Run: `node tests/run-tests.js tests/unit/specialist-batching.test.js tests/unit/no-autocompact-injection.test.js`
 
-Expected: batching fails until templates enforce it; the environment test may
+Expected: batching instruction fails until templates render it; the environment test may
 already pass upstream and then remains a regression-only commit.
 
 - [ ] **Step 3: Implement only fixed batching**
 
-Use the resolved positive integer to chunk specialist assignments. Do not read
-machine thread count, memory, provider quota, or adaptive settings. Remove only
+Render the resolved positive integer into one concise, explicit batching
+instruction. Do not add a disconnected scheduler simulation or claim that
+Zeroshot intercepts provider-native child launches. Do not read machine thread
+count, memory, provider quota, or adaptive settings. Remove only
 fork-originated automatic autocompact assignment if present; leave explicitly
 inherited user values untouched.
 
@@ -550,6 +730,24 @@ npm run test:cluster-package
 npm run rust:check
 npm run rust:distribution:check
 cargo run -p zeroshot-rust --example generate_cli_docs -- --check
+python3.12 -m venv sdks/python/.venv
+(
+  cd sdks/python
+  .venv/bin/python -m pip install --disable-pip-version-check -e '.[dev]'
+  .venv/bin/python -m ruff check src tests examples
+  .venv/bin/python -m ruff format --check src tests examples
+  .venv/bin/python -m mypy src examples
+  .venv/bin/pydoclint src/zeroshot
+  .venv/bin/python -m pytest
+  .venv/bin/python -m mkdocs build --strict
+  .venv/bin/python -m compileall -q examples
+  ZEROSHOT_PYTHON_VERSION=0.1.0.post1 \
+  ZEROSHOT_PYTHON_WHEEL_PLATFORM=manylinux_2_17_x86_64 \
+  ZEROSHOT_RUST_BINARY=/bin/true \
+    .venv/bin/python -m build --wheel
+  .venv/bin/python -m twine check dist/*.whl
+  .venv/bin/python -c "import zipfile; from pathlib import Path; wheels=list(Path('dist').glob('zeroshot_rust-0.1.0.post1-py3-none-manylinux_2_17_x86_64.whl')); assert len(wheels)==1, wheels; z=zipfile.ZipFile(wheels[0]); assert any(n.endswith('/zeroshot/_bin/zeroshot-rust') for n in z.namelist())"
+)
 npm run audit:production
 npm run release:preflight
 npm pack --dry-run

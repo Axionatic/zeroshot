@@ -12,6 +12,9 @@
 
 ## Global Constraints
 
+- Obey the program plan's serial task admission/handoff contract; no worker may
+  infer cwd or predecessor state from a prior worker's shell.
+
 - Branch from the exact user-accepted reconciled checkpoint R, independently of telemetry.
 - Change only JSON whitespace at prompt-assembly boundaries.
 - Preserve JSON values, property/array order, surrounding prompt wording, headings, fences, and full ISO-8601 timestamps.

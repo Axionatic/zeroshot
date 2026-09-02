@@ -12,6 +12,9 @@
 
 ## Global Constraints
 
+- Obey the program plan's serial task admission/handoff contract; no worker may
+  infer cwd or predecessor state from a prior worker's shell.
+
 - Preflight runs before any model/provider call and is distinct from command proofs and `requiredQualityGates`.
 - New or changed deterministic commands require one-time interactive confirmation.
 - Non-interactive missing gates require `--allow-missing-quality-gate`; `--skip-quality-gate` remains the broad preflight compatibility bypass.
@@ -45,7 +48,7 @@ export interface ApprovedPreflightGateV1 {
   readonly repositoryPath: string;
   readonly command: string;
   readonly fingerprint: string;
-  readonly discovery: 'deterministic' | 'manual';
+  readonly discovery: 'deterministic';
   readonly approvedAt: string;
 }
 
@@ -79,7 +82,7 @@ function isApprovedV1(value: unknown, repositoryPath: string): value is Approved
     typeof value.command === 'string' &&
     value.command.trim().length > 0 &&
     /^[a-f0-9]{64}$/.test(String(value.fingerprint)) &&
-    (value.discovery === 'deterministic' || value.discovery === 'manual') &&
+    value.discovery === 'deterministic' &&
     typeof value.approvedAt === 'string' &&
     Number.isFinite(Date.parse(value.approvedAt))
   );
@@ -149,6 +152,7 @@ export type PreflightGateStatus =
   | 'cancelled'
   | 'launch_error'
   | 'skipped'
+  | 'missing_confirmed'
   | 'missing_allowed';
 
 export interface PreflightGateReceipt {
@@ -159,15 +163,19 @@ export interface PreflightGateReceipt {
   readonly startedAt: string;
   readonly finishedAt: string;
   readonly exitCode?: number;
-  readonly stdout: string;
-  readonly stderr: string;
+  readonly diagnosticsPath?: string;
+  readonly diagnosticsDigest?: string;
   readonly truncated: boolean;
 }
 ```
 
-Tests cover cached match, changed cache with accept/refuse, no suggestion,
-non-TTY missing with and without the narrow flag, broad skip, timeout,
-cancellation, launch error, nonzero exit, output truncation, and redaction.
+Tests cover cached exact command/fingerprint match, command/fingerprint
+mismatch, changed cache with accept/refuse/save/reload, second-run zero prompts,
+cached command with no current suggestion (it still runs), no-cache/no
+suggestion, non-TTY missing with and without the narrow flag, changed
+non-TTY suggestion even with the narrow flag, broad skip, timeout,
+cancellation, descendant cleanup, launch error, nonzero exit, output
+truncation, compact-receipt byte bound, and child-environment exclusion.
 
 - [ ] **Step 2: Run and verify the missing runner**
 
@@ -186,18 +194,36 @@ Use this order exactly:
 if (options.skipQualityGate) return skippedReceipt(options.repositoryRoot);
 const cached = loadApprovedPreflightGate(options.repositoryRoot);
 const suggestion = discoverPreflightGate(options.repositoryRoot);
-if (cached?.discovery === 'manual') {
+if (
+  cached &&
+  suggestion &&
+  cached.command === suggestion.command &&
+  cached.fingerprint === suggestion.fingerprint
+) {
   return executeApprovedGate(cached, options);
 }
-if (cached && suggestion && cached.fingerprint === suggestion.fingerprint) {
+if (cached && !suggestion) {
   return executeApprovedGate(cached, options);
+}
+if (suggestion) {
+  if (!options.interactive) {
+    throw new PreflightGateApprovalError('Current preflight quality gate requires approval');
+  }
+  const approved = await options.confirm(formatApprovalPrompt(suggestion));
+  if (!approved) throw new PreflightGateApprovalError('Preflight quality gate was not approved');
+  saveApprovedPreflightGate(recordFromSuggestion(options.repositoryRoot, suggestion));
+  const reloaded = loadApprovedPreflightGate(options.repositoryRoot);
+  assertCurrentApprovedRecord(reloaded, suggestion);
+  return executeApprovedGate(reloaded, options);
 }
 if (!options.interactive) {
   if (options.allowMissingQualityGate) return missingAllowedReceipt(options.repositoryRoot);
-  throw new PreflightGateApprovalError('No current approved preflight quality gate');
+  throw new PreflightGateApprovalError('No approved preflight quality gate');
 }
-const approved = await options.confirm(formatApprovalPrompt(suggestion));
-if (!approved) throw new PreflightGateApprovalError('Preflight quality gate was not approved');
+const approvedMissing = await options.confirm(formatNoGatePrompt());
+if (!approvedMissing)
+  throw new PreflightGateApprovalError('Missing preflight quality gate was not accepted');
+return missingConfirmedReceipt(options.repositoryRoot);
 ```
 
 When the deterministic suggestion is absent, the interactive confirmation must
@@ -206,12 +232,15 @@ placeholder command.
 
 - [ ] **Step 4: Implement contained execution**
 
-Use `spawn(command, { shell: true, cwd: repositoryPath, env, stdio })` only
-after approval. Enforce `DEFAULT_TIMEOUT_MS = 15 * 60 * 1000` and
-`MAX_CAPTURE_BYTES = 1024 * 1024` per stream. Kill the owned process group on
-timeout/cancellation using the repository's existing process cleanup helper.
-Receipt diagnostics redact environment values whose names match
-`TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL|AUTH`.
+Use `spawn(command, { shell: true, cwd: repositoryPath, env, stdio, detached })`
+only after approval. Build `env` from an explicit platform/toolchain allowlist;
+exclude names matching `TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL|AUTH` before spawn,
+not merely from logs. On POSIX set `detached: true` and call the existing
+termination helper with process-group ownership (`processGroupId === pid`); on
+Windows use its process-tree strategy. Enforce `DEFAULT_TIMEOUT_MS = 15 * 60 *
+1000`, bounded TERM/KILL waits, and `MAX_CAPTURE_BYTES = 1024 * 1024` per
+stream. Persist captured diagnostics in one private owned file and return only
+its path/digest/truncation metadata in the compact receipt.
 
 - [ ] **Step 5: Run focused tests**
 
@@ -222,7 +251,8 @@ npm run typecheck:legacy-lib
 npm run lint
 ```
 
-Expected: PASS; no fixture process remains alive.
+Expected: PASS; no child or grandchild fixture remains alive and the child sees
+only the allowlisted environment.
 
 - [ ] **Step 6: Commit the runner**
 
@@ -240,17 +270,26 @@ git commit -m "feat: run approved preflight quality gates"
 - Modify: `src/legacy-lib/start-cluster-config.ts`
 - Modify: `src/legacy-lib/start-cluster.ts`
 - Modify: `src/orchestrator.js`
-- Modify: `task-lib/runner.js`
+- Modify: `lib/cluster-worker/engine-adapter.js`
+- Modify: the trusted cluster-worker request/profile contract used by that adapter
 - Test: `tests/unit/cli-run-preflight.test.js`
 - Test: `tests/unit/start-cluster-config.test.js`
 - Test: `tests/unit/detached-startup-contract.test.js`
 - Test: `tests/unit/cli-resume-loads-clusters.test.js`
 - Test: `tests/integration/orchestrator-flow.test.js`
+- Test: trusted cluster-worker engine-adapter/contract tests
 
 **Interfaces:**
 
-- Produces CLI booleans `skipQualityGate` and `allowMissingQualityGate`, plus a persisted `preflightQualityGateReceipt`.
-- Extends `prepareClusterConfig(config, settings, providerOverride, paramOverrides = {})` and passes overrides to `TemplateResolver.resolveTemplate`.
+- Produces CLI booleans `skipQualityGate` and `allowMissingQualityGate`, a
+  compact host-owned preflight receipt/reference, and one typed
+  `computePackParamOverrides(options, receipt)` mapping consumed by every
+  initial and dynamic template-resolution path.
+- Establishes an `Orchestrator.start` ordering invariant: every normal product
+  start receives an internally issued receipt or resolves an owned persisted
+  receipt reference for the original canonical repository. This prevents
+  accidental/internal bypass; it is not an authentication boundary against
+  arbitrary code already able to invoke exported internals.
 
 - [ ] **Step 1: Add flag and ordering regressions**
 
@@ -271,9 +310,14 @@ await runClusterPreflight({
 assert.deepStrictEqual(calls, ['system', 'quality']);
 ```
 
-Add detached tests proving the parent persists the receipt and the daemon does
+Add detached tests proving the parent persists the compact receipt in private
+run state, passes only its run-bound reference, and the daemon does
 not rediscover or prompt. Add resume tests proving the absolute repository path
-and receipt survive. Add a protected handoff regression where both flags are
+and compact receipt/reference survive without captured output in
+`ZEROSHOT_RUN_OPTIONS`. Add trusted-worker tests for a valid receipt and for
+missing, plain caller-constructed, stale-root, unknown-version, and failed
+receipts before any provider construction. The public worker request cannot set
+either bypass flag or supply a receipt. Add a protected handoff regression where both flags are
 true and `requiredQualityGates` is unchanged.
 
 - [ ] **Step 2: Run focused tests and verify failures**
@@ -299,11 +343,36 @@ Expected: FAIL on absent flags, receipt, or parameter override threading.
 Resolve the original repository root and run the quality preflight after
 upstream system/provider-auth preflight but before simulation, isolation,
 daemon spawn, orchestrator start, or provider construction. Persist the frozen
-receipt in serialized run options.
+compact receipt in private host-owned run state and serialize only a run-bound
+reference. The CLI issues the foreground/detached receipt. The trusted
+cluster-worker engine adapter leaves the public `LegacyShipRequest` unchanged,
+derives policy from its registry-owned trusted profile, runs preflight locally,
+and issues an in-process receipt before `Orchestrator.start`. The orchestrator
+accepts only the module-private issued form or a receipt loaded by the owned
+run-state resolver before isolation/provider work.
 
-- [ ] **Step 4: Add typed option/config propagation**
+- [ ] **Step 4: Add typed private option/config propagation**
 
-Extend `RunOptions` with both booleans and the receipt. Change:
+Extend `RunOptions` and a module-private trusted-worker adapter context with both
+booleans and the compact receipt. Registry-owned trusted profile policy feeds
+that context. Do not add any field to public `LegacyShipRequest`, its strict
+schema, or its RPC start frame. Define one mapping before any config is resolved:
+
+```ts
+function computePackParamOverrides(options, receipt) {
+  return {
+    preflight_quality_gate: !options.skipQualityGate && receipt.status === 'passed',
+  };
+}
+```
+
+Filter this system-owned override against the selected template's declared
+parameter schema; generic templates receive no extra key. Normalize the legacy
+alias before strict unknown-user-parameter validation and reject alias
+conflicts. Thread the filtered object through foreground `loadClusterConfig`, direct start
+helpers, trusted worker preparation, detached serialization, resume, and
+dynamic `_opLoadConfig`. It overrides the optional pack parameter only and
+never mutates `requiredQualityGates`. Then change:
 
 ```ts
 function resolveParameterizedConfigFile(
@@ -315,8 +384,10 @@ function resolveParameterizedConfigFile(
 }
 ```
 
-Use pack parameter overrides only for the optional pack pre-validation phase;
-never rewrite `options.requiredQualityGates`.
+For backward compatibility, keep `quality_gate` as a deprecated alias only
+when that template declares it; reject simultaneous old/new names with a
+deterministic migration error. Test every upstream generic parameterized
+template unchanged plus both direct and conductor-driven pack loads.
 
 - [ ] **Step 5: Run launch-path tests and builds**
 
@@ -334,7 +405,7 @@ Expected: PASS and no provider dependency called by the preflight unit tests.
 - [ ] **Step 6: Commit launch propagation**
 
 ```bash
-git add cli/index.js src/legacy-lib/start-cluster-run-options.ts src/legacy-lib/start-cluster-config.ts src/legacy-lib/start-cluster.ts src/orchestrator.js task-lib/runner.js lib task-lib tests/unit/cli-run-preflight.test.js tests/unit/start-cluster-config.test.js tests/unit/detached-startup-contract.test.js tests/unit/cli-resume-loads-clusters.test.js tests/integration/orchestrator-flow.test.js
+git add cli/index.js src/legacy-lib/start-cluster-run-options.ts src/legacy-lib/start-cluster-config.ts src/legacy-lib/start-cluster.ts src/orchestrator.js lib/cluster-worker tests/unit/cli-run-preflight.test.js tests/unit/start-cluster-config.test.js tests/unit/detached-startup-contract.test.js tests/unit/cli-resume-loads-clusters.test.js tests/integration/orchestrator-flow.test.js
 git commit -m "feat: enforce preflight before provider launch"
 ```
 
@@ -345,22 +416,38 @@ Review staged generated output and exclude unrelated build churn before commit.
 **Files:**
 
 - Create: `src/workflow-operations/types.ts`
+- Create: `src/workflow-operations/review-events.ts`
 - Create: `src/workflow-operations/registry.ts`
 - Create: `src/workflow-operations/execute.ts`
+- Create: `src/workflow-operations/workflow-runtime.ts`
 - Modify: `src/config-validator.js`
-- Modify: `src/agent/agent-hook-executor.js`
+- Modify: `src/ledger.js`
+- Modify: `src/message-bus.js`
+- Modify: `src/agent-wrapper.js`
+- Modify: `src/agent/agent-lifecycle.js`
+- Modify: `tsconfig.legacy-runtime.json`
+- Modify: `tsconfig.legacy-runtime.build.json`
 - Test: `tests/unit/workflow-operation-registry.test.js`
+- Test: `tests/integration/trigger-evaluation.test.js`
 - Modify: `tests/config-validator.test.js`
 
 **Interfaces:**
 
-- Produces: `WorkflowOperationId`, `WorkflowOperationContext`, `WorkflowOperationResult`, `getWorkflowOperation(id)`, and `executeWorkflowOperation(id, context)`.
+- Produces: `WorkflowOperationId`, frozen `WorkflowOperationDescriptor`, a
+  versioned shared review envelope, a frozen registry factory, a cluster-owned
+  `WorkflowRuntime`, and one
+  end-to-end `executeWorkflowOperation(id, context, publication)` boundary that
+  returns a durable `OperationDisposition`.
 - Adds trigger `{ action: 'execute_workflow_operation', operation: WorkflowOperationId }` with no routing/command fields.
 
 - [ ] **Step 1: Write closed-enum validation tests**
 
 ```js
-const valid = { action: 'execute_workflow_operation', operation: 'review.synthesize' };
+const valid = {
+  topic: 'REVIEW_ROUND_READY',
+  action: 'execute_workflow_operation',
+  operation: 'review.synthesize',
+};
 assert.doesNotThrow(() => validateTrigger(valid));
 for (const invalid of [
   { ...valid, operation: 'shell.run' },
@@ -374,8 +461,14 @@ for (const invalid of [
 
 - [ ] **Step 2: Add registry and failure-boundary tests**
 
-Test all three IDs, frozen registry behavior, unknown IDs, abort propagation,
-bounded redacted failures, owned output topics, and `terminal` preservation.
+Test the closed three-ID vocabulary, frozen registry-factory behavior with
+fixture subsets, unknown/unregistered runtime IDs, action/topic
+cross-validation, snapshot-bounded queries, output validation, abort
+propagation, bounded redacted failures, and descriptor-owned output/terminal
+semantics. Task 4 does not install placeholder production descriptors. Task 5
+adds `review.synthesize`; Task 6 adds the two document descriptors. Each task
+tests only descriptors implemented by that checkpoint, and Task 6 proves the
+final registry contains all three.
 
 - [ ] **Step 3: Run tests and verify the action is unknown**
 
@@ -422,15 +515,46 @@ export interface WorkflowOperationContext {
   readonly clusterId: string;
   readonly agentId: string;
   readonly triggeringMessage: WorkflowMessage;
+  readonly workflowInstance: {
+    readonly state: 'sealed';
+    readonly id: string;
+    readonly family: 'code-review' | 'documentation-review' | 'document-draft';
+    readonly descriptorRevision: string;
+    readonly configRevision: string;
+    readonly expectedAnalystIds: readonly string[];
+    readonly expectedValidatorIds: readonly string[];
+    readonly artifact: {
+      readonly id: string;
+      readonly mediaType: 'text/markdown';
+      readonly sourceTopic: 'REVIEW_ARTIFACT_READY' | 'DOCUMENT_ARTIFACT_READY';
+    };
+  };
   readonly ledger: WorkflowLedgerReader;
   readonly signal: AbortSignal;
   readonly now: () => Date;
 }
 
-export interface WorkflowOperationResult {
-  readonly topic: string;
+export type WorkflowOperationResult = {
+  readonly state: 'ready';
   readonly content: { readonly text: string; readonly data: Record<string, unknown> };
-  readonly terminal: boolean;
+};
+
+export interface WorkflowOperationDescriptor {
+  readonly allowedInputTopics: readonly string[];
+  readonly successTopic: string;
+  readonly failureTopic: string;
+  readonly terminalOnSuccess: 'never' | 'immediate' | 'after_artifact_commit';
+  readonly terminalOnFailure: boolean;
+  readonly validateOutput: (value: unknown) => WorkflowOperationResult;
+  readonly execute: (context: WorkflowOperationContext) => Promise<WorkflowOperationResult>;
+}
+
+export interface ArtifactReadyPayload {
+  readonly artifactId: string;
+  readonly markdown: string;
+  readonly checksum: string;
+  readonly sourceSequence: string;
+  readonly executionKey: string;
 }
 
 export const WORKFLOW_OPERATION_IDS = Object.freeze([
@@ -440,35 +564,122 @@ export const WORKFLOW_OPERATION_IDS = Object.freeze([
 ] as const);
 ```
 
-The executor receives the orchestrator-owned ledger instance and message bus;
-it does not open a database from an environment variable. Convert exceptions
-to the operation's fixed failure topic and return control to the common
-terminal lifecycle.
+The executor receives a read-only facade over `agent.messageBus.ledger`; it does
+not open a database from an environment variable. The facade automatically
+adds `throughId: triggeringMessage.sequence` to every query and sorts by durable
+sequence. The descriptor, not the template or implementation result, selects
+success/failure topics and terminal behavior. Convert exceptions to the fixed
+failure topic and return control to the common terminal lifecycle.
+Operations run only from deterministic host-owned readiness events and therefore
+return `ready` or fail. Quorum waiting is not an operation result; the review
+round coordinator owns it before synthesis begins.
 
-- [ ] **Step 5: Wire the trigger action**
+Final-operation output validation derives `ArtifactReadyPayload` from the
+installed immutable artifact binding. It computes/validates checksum and stamps
+source sequence/execution key; artifact identity is never accepted from model
+output. The host writer accepts only a payload matching that binding and the
+descriptor-owned success topic.
 
-In `agent-hook-executor.js`, call only:
+In `review-events.ts`, define a versioned common envelope carrying family,
+review ID, round, finding ID/candidate revision where applicable, validator ID,
+causation ID, idempotency key, and `throughSequence`. Keep code-review and
+documentation-review payloads distinct discriminated variants. This file is
+the contract consumed verbatim by Task 5 and the workflow-pack child plan.
+The envelope's expected-validator field is only a redundant assertion. The
+executor derives a sorted immutable validator set and configuration revision
+from the resolved host-owned workflow instance; any model-authored mismatch is
+rejected before aggregation.
+
+The host supplies a semantic execution key. For review synthesis it is exactly
+`(workflowInstanceId, configRevision, reviewId, round, operationId)`; trigger
+message ID, winning `throughSequence`, causation ID, and input digest are stored
+as conflict evidence, never as output identity. Document operations use their
+descriptor-defined document/revision semantic key. Derive the execution message
+ID from that stable key.
+
+Add `Ledger.appendIfAbsent` and `MessageBus.publishIfAbsent`. The atomic result
+is `inserted`, `reused` only when semantic input identity and output digest
+match, or `conflict`; generic and topic subscribers fire only for `inserted`.
+`executeWorkflowOperation` owns execution, validation, this publication call,
+and returns the resulting disposition. Replay callers receive `reused` without
+another ordinary event. The explicit `WorkflowRuntime` startup/resume catch-up
+may re-deliver a persisted pending outbox row; consumers deduplicate by its
+execution/message key. Snapshot-bounded reads remain operation inputs only.
+
+`WorkflowRuntime` is a provider-free cluster service over the sealed descriptor,
+registry, ledger state transaction, message bus, and family reducer. It exposes
+`claimReadyOperation(operationId, readyMessage)` and rejects a ready topic unless
+sender, deterministic ID, semantic key, digest, and frozen cursor match a
+durable host claim. It rehydrates unfinished claims and re-drives durable ready
+messages after agents subscribe on start/resume. This task implements and tests
+that generic shell with fixture reducers; Tasks 5 and 6 supply the real review
+and document reducers, and the workflow-pack Task 1 owns orchestrator attachment.
+
+- [ ] **Step 5: Wire the actual trigger dispatcher**
+
+Add `execute_workflow_operation` to `executeTriggerAction` in
+`src/agent/agent-lifecycle.js`, not to the onStart/onComplete hook executor.
+Resolve the frozen descriptor first and require
+`workflowRuntime.claimReadyOperation(...)` to return the durable execution
+claim. For final artifact operations (`review.synthesize` and
+`document.assemble`), call `terminalCoordinator.begin` before operation code.
+For nonterminal `document.build_revision_context`, do not enter or mutate the
+terminal state machine; use the runtime claim's bounded per-operation deadline
+and the ordinary cluster cancellation signal. Then call only:
 
 ```js
-await executeWorkflowOperation(trigger.operation, {
-  clusterId: agent.cluster_id,
-  agentId: agent.id,
-  triggeringMessage: message,
-  ledger: agent.ledger,
-  signal: agent.abortSignal,
-  now: () => new Date(),
-});
+const terminalClaim =
+  descriptor.terminalOnSuccess === 'after_artifact_commit'
+    ? await agent.cluster.terminalCoordinator.begin(
+        claimedExecution.executionKey,
+        claimedExecution.reason
+      )
+    : null;
+const disposition = await executeWorkflowOperation(
+  trigger.operation,
+  {
+    clusterId: agent.cluster.id,
+    agentId: agent.id,
+    triggeringMessage: message,
+    workflowInstance: agent.cluster.workflowInstance,
+    ledger: createSnapshotLedgerReader(agent.messageBus.ledger, message.sequence),
+    signal: terminalClaim?.signal ?? claimedExecution.signal,
+    now: () => new Date(message.timestamp),
+  },
+  {
+    executionKey: claimedExecution.executionKey,
+    publishIfAbsent: agent.messageBus.publishIfAbsent.bind(agent.messageBus),
+  }
+);
 ```
 
-Publish the returned fixed topic/content through the existing message bus.
-When `terminal` is true, enter the idempotent terminalization boundary from the
-foundation plan.
+Do not separately call the void `agent._publish`. Descriptor-owned routing and
+subscriber emission live inside the publication boundary above. A readiness
+result of `waiting` returns idle before execution. Only a claimed final-artifact
+operation calls `begin`; its deadline covers a hanging operation. A claimed
+nonterminal operation records completion/failure in its workflow-state key and
+returns to ordinary workflow progress without terminalization. Report final
+success/failure/cancellation through the shared coordinator. Add an integration
+test that delivers a real topic through
+`AgentWrapper.handleMessage`, observes the operation event, and proves
+cancellation/late results cannot double-terminalize. Also prove duplicate
+delivery emits once to both generic and topic subscribers, and a never-settling
+operation reaches one deadline failure.
+
+For a final operation, require `terminalClaim.executionKey ===
+claimedExecution.executionKey` and execute only `claimed`/valid `reused`
+dispositions; `terminal` returns without work. Deadline/cancellation must abort
+the exact signal passed above. A late result after abort cannot publish an
+artifact or mutate terminal state.
+
+Add `src/workflow-operations/**/*.ts` to both legacy-runtime tsconfig include
+sets and assert a clean build emits loadable adjacent JavaScript.
 
 - [ ] **Step 6: Build and run contract tests**
 
 ```bash
 npm run build:legacy-runtime
-node tests/run-tests.js tests/unit/workflow-operation-registry.test.js tests/config-validator.test.js tests/unit/hook-logic-executor.test.js tests/integration/trigger-evaluation.test.js
+node tests/run-tests.js tests/unit/workflow-operation-registry.test.js tests/config-validator.test.js tests/integration/trigger-evaluation.test.js
 npm run typecheck:legacy-runtime
 npm run lint
 ```
@@ -478,7 +689,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit the closed boundary**
 
 ```bash
-git add src/workflow-operations src/config-validator.js src/agent/agent-hook-executor.js tests/unit/workflow-operation-registry.test.js tests/config-validator.test.js
+git add src/workflow-operations src/config-validator.js src/ledger.js src/message-bus.js src/agent-wrapper.js src/agent/agent-lifecycle.js tsconfig.legacy-runtime.json tsconfig.legacy-runtime.build.json tests/unit/workflow-operation-registry.test.js tests/config-validator.test.js tests/integration/trigger-evaluation.test.js
 git commit -m "feat: add closed workflow operation boundary"
 ```
 
@@ -489,23 +700,50 @@ Include generated adjacent `.js` files only when produced by
 
 **Files:**
 
+- Create: `src/workflow-operations/review-round-coordinator.ts`
 - Create: `src/workflow-operations/review-synthesis.ts`
+- Create: `tests/unit/review-round-coordinator.test.js`
 - Test: `tests/review-synthesis-operation.test.js`
 
 **Interfaces:**
 
 - Registers: `review.synthesize`.
-- Produces topic `REVIEW_ARTIFACT_READY` on success, `REVIEW_SYNTHESIS_FAILED` on bounded failure; success is terminal.
+- Produces topic `REVIEW_ARTIFACT_READY` on success and
+  `REVIEW_SYNTHESIS_FAILED` on bounded failure. Success uses descriptor policy
+  `after_artifact_commit`; the artifact owner, not the operation executor,
+  terminalizes after accepting the artifact (and after file commit when
+  `--output` is present).
+- Consumes only the versioned envelopes from `review-events.ts`, bounded through
+  the synthesis request's `throughSequence`.
+- Produces a provider-free persisted `ReviewRoundCoordinator`. Each expected
+  analyst must emit a schema-checked round-complete envelope even for zero
+  findings. The coordinator waits for the sealed descriptor's analyst set and
+  any validators required by their findings, freezes one `throughSequence`, and
+  compare-and-set claims the round-scoped execution key. It then emits exactly
+  one host-owned `REVIEW_ROUND_READY`; model messages cannot assert readiness.
+
+Register this reducer with `WorkflowRuntime`. It consumes only validated durable
+progress messages, and uses `transitionWorkflowState` to CAS the round claim and
+insert the deterministic `REVIEW_ROUND_READY` row in one transaction. Runtime
+catch-up re-drives a committed ready row whose live delivery or operation claim
+was interrupted; the dispatcher still requires the matching durable claim.
 
 - [ ] **Step 1: Add literal synthesis fixtures and failing tests**
 
-Fixtures must cover zero findings, confirmed only, withdrawn, severity change,
-contested at cap, retry-duplicated validator messages, malformed candidate, and
-out-of-order delivery. Assert:
+Before fixtures, pin the complete aggregation table: expected validator IDs;
+one latest valid verdict per `(reviewId, round, findingId, candidateRevision,
+validatorId)` by durable sequence; stale/future rounds rejected; duplicate
+idempotency keys ignored; missing/failed validators make the finding contested;
+only the originating analyst may withdraw; any contest forces `NOT_READY`; and
+zero findings produces an explicit ready artifact without validators.
+
+Fixtures must cover every table row, severity conflicts, zero findings,
+confirmed only, withdrawn, contested at cap, retry-duplicated validator
+messages, malformed candidate, late prior-round input, a higher-sequence row
+after the request snapshot, and out-of-order delivery. Assert:
 
 ```js
-assert.strictEqual(result.topic, 'REVIEW_ARTIFACT_READY');
-assert.strictEqual(result.terminal, true);
+assert.strictEqual(result.state, 'ready');
 assert.match(result.content.text, /## Contested Findings/);
 assert.strictEqual(result.content.data.overallAssessment, 'NOT_READY');
 assert.deepStrictEqual(result.content.data.statistics, {
@@ -515,28 +753,38 @@ assert.deepStrictEqual(result.content.data.statistics, {
 });
 ```
 
+Separately assert the frozen descriptor owns success topic
+`REVIEW_ARTIFACT_READY` and policy `after_artifact_commit`, and prove through the
+dispatcher integration that no success terminal precedes artifact acceptance.
+
+Add coordinator fixtures for all-zero and mixed analyst results, missing analyst
+completion, duplicate/late completions, concurrent final validator messages,
+resume before/after claim, and a new review round. Prove all triggers for one
+completed round reuse the same execution disposition and never create a second
+artifact.
+
 - [ ] **Step 2: Run and verify the operation is missing**
 
 ```bash
 npm run build:legacy-runtime
-node tests/run-tests.js tests/review-synthesis-operation.test.js
+node tests/run-tests.js tests/unit/review-round-coordinator.test.js tests/review-synthesis-operation.test.js
 ```
 
 Expected: FAIL on missing implementation/registration.
 
 - [ ] **Step 3: Implement deterministic classification and Markdown**
 
-Sort findings by stable finding ID and validators by agent ID. Preserve all
-validator reasons and severity adjustments. Set `READY` only when no confirmed
-blocking or contested finding remains; any contested finding forces
-`NOT_READY`. Render fixed headings for Confirmed, Contested, Withdrawn,
+Validate the shared envelopes, apply the pinned table, and sort findings by
+stable finding ID and validators by agent ID. Preserve all validator reasons and
+severity adjustments. Set `READY` only when no confirmed blocking or contested
+finding remains. Render fixed headings for Confirmed, Contested, Withdrawn,
 Validator Notes, Severity Adjustments, and Statistics.
 
 - [ ] **Step 4: Run synthesis and lifecycle tests**
 
 ```bash
 npm run build:legacy-runtime
-node tests/run-tests.js tests/review-synthesis-operation.test.js tests/unit/bounded-synthesis-lifecycle.test.js tests/unit/ledger-sequence-cursor.test.js
+node tests/run-tests.js tests/unit/review-round-coordinator.test.js tests/review-synthesis-operation.test.js tests/unit/bounded-synthesis-lifecycle.test.js tests/unit/ledger-sequence-cursor.test.js
 npm run typecheck:legacy-runtime
 npm run lint
 ```
@@ -546,7 +794,7 @@ Expected: PASS and stable byte-for-byte Markdown on repeated input.
 - [ ] **Step 5: Commit review synthesis**
 
 ```bash
-git add src/workflow-operations/review-synthesis.ts src/workflow-operations/review-synthesis.js src/workflow-operations/registry.ts src/workflow-operations/registry.js tests/review-synthesis-operation.test.js
+git add src/workflow-operations/review-round-coordinator.ts src/workflow-operations/review-round-coordinator.js src/workflow-operations/review-synthesis.ts src/workflow-operations/review-synthesis.js src/workflow-operations/registry.ts src/workflow-operations/registry.js tests/unit/review-round-coordinator.test.js tests/review-synthesis-operation.test.js
 git commit -m "feat: synthesize truthful review artifacts"
 ```
 
@@ -555,6 +803,7 @@ git commit -m "feat: synthesize truthful review artifacts"
 **Files:**
 
 - Create: `src/workflow-operations/document-reconstruction.ts`
+- Create: `src/workflow-operations/document-round-coordinator.ts`
 - Create: `src/workflow-operations/document-revision-context.ts`
 - Create: `src/workflow-operations/document-assembly.ts`
 - Test: `tests/doc-reconstruction.test.js`
@@ -564,13 +813,25 @@ git commit -m "feat: synthesize truthful review artifacts"
 
 - Registers: `document.build_revision_context` and `document.assemble`.
 - Produces: `REVISION_CONTEXT`, `DOCUMENT_ARTIFACT_READY`, and fixed failure topics.
+- Consumes a closed document envelope with immutable `documentId`, monotonically
+  increasing `revision`, exact `baseRevision`, `validationRound`,
+  `causationMessageId`, `idempotencyKey`, and `throughSequence`.
+- Registers a deterministic document reducer with `WorkflowRuntime`. From the
+  sealed validator set and snapshot-bounded current revision it emits only
+  `DOCUMENT_REVISION_READY` below cap when revisions are needed, or
+  `DOCUMENT_ASSEMBLY_READY` on unanimous approval or at cap. Each ready topic,
+  semantic operation key, revision/round cursor, and state transition is
+  inserted atomically through `transitionWorkflowState`; model messages cannot
+  choose the branch or claim readiness.
 
 - [ ] **Step 1: Port reconstruction behavior into failing pure tests**
 
 Assert the first message must contain `.document`; later `.delta` values apply
 removed sections, replacements, revisions, additions, and `insertAfter` in a
 stable order. Reject duplicate IDs, unknown revision targets, invalid depth,
-and an absent base document instead of silently dropping data.
+an absent base document, a delta whose base is not the current revision,
+stale/future validation rounds, and duplicate idempotency keys instead of
+silently dropping or reapplying data.
 
 - [ ] **Step 2: Add revision and cap artifact tests**
 
@@ -590,9 +851,16 @@ assert.match(artifact.content.text, /## Unresolved Sections/);
 assert.match(artifact.content.text, /missing source/);
 ```
 
-Also test unanimous approval yields `ALL_APPROVED`, notes survive, retry
-duplicates are deduplicated, and only the latest validator round controls
-unresolved status.
+Pin expected validator IDs and the treatment of `APPROVE_WITH_NOTES`, missing or
+failed validators, and conflicting retries. Also test unanimous approval yields
+`ALL_APPROVED`, notes survive, retry duplicates are deduplicated, and only the
+snapshot-bounded validator round tied to the current document revision controls
+unresolved status. Replay each operation twice and after resume to prove the
+same idempotency key produces byte-identical output without another transition.
+Add reducer tests for partial quorum, conflicting retries, unanimous approval,
+revision below cap, cap assembly, duplicate/late validation, and resume before
+and after each ready-message delivery. Prove revision context never enters
+terminal synthesis and final assembly does.
 
 - [ ] **Step 3: Run tests and verify missing implementations**
 
@@ -607,10 +875,15 @@ Expected: FAIL.
 
 Move the useful pure behavior from prior-art
 `scripts/lib/doc-reconstruction.js`, but accept typed ledger messages directly.
-Use `context.now().toISOString()` for metadata. `document.assemble` returns
+Use `context.now().toISOString()` for metadata, where the dispatcher derives
+`now` from the durable triggering-message timestamp so replay after wall-clock
+advance remains byte-identical. `document.assemble` returns
 Markdown in memory; it never writes a file.
 
 - [ ] **Step 5: Build and run document tests**
+
+Assert the composed production registry is now frozen and contains exactly all
+three `WORKFLOW_OPERATION_IDS`; no earlier task installs an executable stub.
 
 ```bash
 npm run build:legacy-runtime
@@ -624,7 +897,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit document operations**
 
 ```bash
-git add src/workflow-operations/document-reconstruction.ts src/workflow-operations/document-reconstruction.js src/workflow-operations/document-revision-context.ts src/workflow-operations/document-revision-context.js src/workflow-operations/document-assembly.ts src/workflow-operations/document-assembly.js src/workflow-operations/registry.ts src/workflow-operations/registry.js tests/doc-reconstruction.test.js tests/document-workflow-operations.test.js
+git add src/workflow-operations/document-reconstruction.ts src/workflow-operations/document-reconstruction.js src/workflow-operations/document-round-coordinator.ts src/workflow-operations/document-round-coordinator.js src/workflow-operations/document-revision-context.ts src/workflow-operations/document-revision-context.js src/workflow-operations/document-assembly.ts src/workflow-operations/document-assembly.js src/workflow-operations/registry.ts src/workflow-operations/registry.js tests/doc-reconstruction.test.js tests/document-workflow-operations.test.js
 git commit -m "feat: add typed document workflow operations"
 ```
 
