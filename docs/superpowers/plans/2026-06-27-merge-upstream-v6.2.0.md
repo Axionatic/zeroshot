@@ -1,10 +1,15 @@
 # Merge Upstream zeroshot v6.2.0 Implementation Plan
 
+> **Superseded on 2026-09-02:** Do not execute this plan. It targets an older
+> baseline and mechanical merge strategy. Use
+> `docs/superpowers/plans/2026-09-02-upstream-v6.46-reconciliation-program.md`;
+> this file remains only as fork prior art.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Merge upstream's breaking v6.2.0 re-architecture into the `@covibes` fork, absorbing its improvements while preserving the fork's distinct behaviors and rejecting the upstream rebrand.
 
-**Architecture:** Land-then-refine, corrected for the *actual* merge shape (verified by a scratch merge of `upstream/main` into `main`). Most fork-behavior files **auto-merge and keep fork code** — they need survival *assertions*, not re-ports. The real exposure is (a) genuine conflicts whose fork hunks would be lost to a careless resolution, and (b) files that **auto-merge to upstream's rebrand/redirect** and therefore need *active* intervention precisely because they do **not** conflict. Task 0 resolves every conflict to a green building baseline, deferring only the two genuine conflict-losses that are large enough to warrant their own TDD cycle (context-builder compression, hook VM hardening). Tasks 1–5 refine; Task 6 verifies.
+**Architecture:** Land-then-refine, corrected for the _actual_ merge shape (verified by a scratch merge of `upstream/main` into `main`). Most fork-behavior files **auto-merge and keep fork code** — they need survival _assertions_, not re-ports. The real exposure is (a) genuine conflicts whose fork hunks would be lost to a careless resolution, and (b) files that **auto-merge to upstream's rebrand/redirect** and therefore need _active_ intervention precisely because they do **not** conflict. Task 0 resolves every conflict to a green building baseline, deferring only the two genuine conflict-losses that are large enough to warrant their own TDD cycle (context-builder compression, hook VM hardening). Tasks 1–5 refine; Task 6 verifies.
 
 **Tech Stack:** Node.js (CommonJS `src/`), TypeScript (`src/agent-cli-provider/` → compiled to gitignored `lib/agent-cli-provider/`), Mocha test suite (`npm test`), ESLint (flat config, needs `typescript-eslint`), git worktree/PR workflow.
 
@@ -22,18 +27,18 @@
 
 ### Verified conflict set (from scratch merge — do not re-derive)
 
-| Kind | Files | Default handling |
-|---|---|---|
-| **Content (UU), take upstream** | `eslint.config.mjs`, `README.md`, `tests/settings-providers.test.js`, `tests/verify-github-pr-hook.test.js`, `task-lib/runner.js` | `--theirs` (+ identity fix on README) |
-| **Content (UU), keep fork** | `CLAUDE.md` | `--ours` |
-| **Content (UU), union — graft named fork hunk onto upstream base** | `lib/start-cluster.js`, `src/agent-wrapper.js`, `src/config-validator.js`, `src/orchestrator.js`, `src/template-validation/index.js` | hand-union (below) — take upstream as base, graft ONLY the named fork addition; literal "keep both sides" produces redeclare/dup-key errors |
-| **Content (UU), take upstream + DEFER re-port** | `src/agent/agent-context-builder.js` (→Task 2), `src/agent/agent-hook-executor.js` (→Task 1), `src/agents/git-pusher-template.js` (→Task 4) | `--theirs` now |
-| **Regenerate** | `package-lock.json` | delete + `npm install` |
-| **Delete/modify (DU), keep deleted** | `.github/workflows/release.yml`, `.releaserc.json`, `AGENTS.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `PUBLISHING.md`, `docs/postmortems/2026-01-31-pr-base-detached.md` | `git rm` |
-| **Modify/delete (UD), keep deleted** | `src/providers/anthropic/models.js` | `git rm` |
-| **AUTO-ADDED rebrand apparatus (clean-add, NOT a conflict) — DELETE** | `legacy/covibes-zeroshot-bridge/`, `.github/workflows/publish-covibes-bridge.yml`, `tests/legacy-covibes-bridge.test.js`, `tests/unit/release-hygiene.test.js` | `git rm` (Step 2b) |
-| **AUTO-MERGE to rebrand/redirect — ACTIVE FIX** | `package.json`, `cli/index.js`, `cli/lib/update-checker.js`, `tests/update-checker.test.js`, `scripts/setup-merge-queue.sh` | strip legacy-distro/identity (below) |
-| **AUTO-MERGE, fork behavior survives — ASSERT only** | `src/providers/base-provider.js`, `src/agent/agent-task-executor.js`, `cluster-templates/base-templates/{full-workflow,worker-validator}.json`, `src/agent/agent-lifecycle.js`, `src/template-resolver.js`, `tests/max-model.test.js` | grep-assert in Task 0 Step 11 |
+| Kind                                                                  | Files                                                                                                                                                                                                                                 | Default handling                                                                                                                            |
+| --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Content (UU), take upstream**                                       | `eslint.config.mjs`, `README.md`, `tests/settings-providers.test.js`, `tests/verify-github-pr-hook.test.js`, `task-lib/runner.js`                                                                                                     | `--theirs` (+ identity fix on README)                                                                                                       |
+| **Content (UU), keep fork**                                           | `CLAUDE.md`                                                                                                                                                                                                                           | `--ours`                                                                                                                                    |
+| **Content (UU), union — graft named fork hunk onto upstream base**    | `lib/start-cluster.js`, `src/agent-wrapper.js`, `src/config-validator.js`, `src/orchestrator.js`, `src/template-validation/index.js`                                                                                                  | hand-union (below) — take upstream as base, graft ONLY the named fork addition; literal "keep both sides" produces redeclare/dup-key errors |
+| **Content (UU), take upstream + DEFER re-port**                       | `src/agent/agent-context-builder.js` (→Task 2), `src/agent/agent-hook-executor.js` (→Task 1), `src/agents/git-pusher-template.js` (→Task 4)                                                                                           | `--theirs` now                                                                                                                              |
+| **Regenerate**                                                        | `package-lock.json`                                                                                                                                                                                                                   | delete + `npm install`                                                                                                                      |
+| **Delete/modify (DU), keep deleted**                                  | `.github/workflows/release.yml`, `.releaserc.json`, `AGENTS.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `PUBLISHING.md`, `docs/postmortems/2026-01-31-pr-base-detached.md`                                                                | `git rm`                                                                                                                                    |
+| **Modify/delete (UD), keep deleted**                                  | `src/providers/anthropic/models.js`                                                                                                                                                                                                   | `git rm`                                                                                                                                    |
+| **AUTO-ADDED rebrand apparatus (clean-add, NOT a conflict) — DELETE** | `legacy/covibes-zeroshot-bridge/`, `.github/workflows/publish-covibes-bridge.yml`, `tests/legacy-covibes-bridge.test.js`, `tests/unit/release-hygiene.test.js`                                                                        | `git rm` (Step 2b)                                                                                                                          |
+| **AUTO-MERGE to rebrand/redirect — ACTIVE FIX**                       | `package.json`, `cli/index.js`, `cli/lib/update-checker.js`, `tests/update-checker.test.js`, `scripts/setup-merge-queue.sh`                                                                                                           | strip legacy-distro/identity (below)                                                                                                        |
+| **AUTO-MERGE, fork behavior survives — ASSERT only**                  | `src/providers/base-provider.js`, `src/agent/agent-task-executor.js`, `cluster-templates/base-templates/{full-workflow,worker-validator}.json`, `src/agent/agent-lifecycle.js`, `src/template-resolver.js`, `tests/max-model.test.js` | grep-assert in Task 0 Step 11                                                                                                               |
 
 ---
 
@@ -44,6 +49,7 @@ Resolve every conflict and defuse the auto-merge rebrand/redirect landmines so `
 **Files:** see the Verified conflict set table above.
 
 **Interfaces:**
+
 - Produces: `merge/v6.2.0` with one merge commit; `@covibes` identity intact; agent-cli-provider build wired; suite green (one skip group: `tests/cannot-validate-status.test.js`).
 
 - [ ] **Step 1: Branch and start the merge**
@@ -61,6 +67,7 @@ git rm .github/workflows/release.yml .releaserc.json AGENTS.md CHANGELOG.md \
   CONTRIBUTING.md PUBLISHING.md docs/postmortems/2026-01-31-pr-base-detached.md \
   src/providers/anthropic/models.js
 ```
+
 (Note the path is `.github/workflows/release.yml`, NOT a top-level `release.yml`. `models.js` opus-4.6 edit is superseded by `src/agent-cli-provider/adapters/claude.ts`.)
 
 - [ ] **Step 2b: Delete the auto-added rebrand apparatus (clean-adds, no conflict marker)**
@@ -73,6 +80,7 @@ git rm -rf legacy/covibes-zeroshot-bridge \
   tests/legacy-covibes-bridge.test.js \
   tests/unit/release-hygiene.test.js
 ```
+
 (`-f` is required: these are staged as ADDED files, `M`/`A` in the index. `git rm` without `-f` refuses with "the following file has changes staged in the index … use -f to force removal" (exit 1) and removes nothing — leaving the forbidden redirect bridge in place and `release-hygiene.test.js` in the suite. Step 2's keep-deleted DU/UD removals work without `-f`; only this clean-add batch needs it.)
 (`release-hygiene.test.js`'s `readText()` has no try/catch and unconditionally reads `.github/workflows/release.yml` + `.releaserc.json`, both removed in Step 2 → it would fail Step 12's green-baseline gate.)
 
@@ -87,6 +95,7 @@ git add eslint.config.mjs tests/settings-providers.test.js tests/verify-github-p
   task-lib/runner.js src/agent/agent-context-builder.js src/agent/agent-hook-executor.js \
   src/agents/git-pusher-template.js
 ```
+
 (`runner.js`: upstream form `finalArgs: commandSpec.args`; the fork's `resolveFinalArgs` call is gone upstream, and `MAX_ID_RETRIES` survives outside the markers.)
 
 - [ ] **Step 4: Keep-fork — CLAUDE.md**
@@ -126,16 +135,19 @@ u.description=(u.description||'')+' (fork of the-open-engine/zeroshot)'; \
 if(Array.isArray(u.files)) u.files=u.files.filter(f=>f!=='CHANGELOG.md'); \
 require('fs').writeFileSync('package.json', JSON.stringify(u,null,2)+'\n')"
 ```
+
 (`CHANGELOG.md` is git-rm'd in Step 2; leaving it in `files` triggers an npm pack warning.)
 Confirm no TUI script targets remain and none are referenced by `check`/`dev:bootstrap`/`prepublishOnly`/`postinstall`:
+
 ```bash
 git grep -nE 'tui-backend|install-tui-binary|build:tui|dev:tui' -- package.json   # expect zero
 ```
+
 Remove any stragglers (and their callers) by hand. Then `git add package.json`.
 
 - [ ] **Step 8: Strip the legacy-distro redirect AND repoint the install target to @covibes**
 
-These auto-merged to upstream's `@covibes → @the-open-engine` redirect; no conflict marker flags them. The redirect is not isolated to the legacy-distro block — `getUpdateTarget()` calls `isLegacyDistro(packageName)` (~177) and `buildInstallArgs` pushes `NEW_PACKAGE_SPEC` (~198), so the *kept* install path itself installs `@the-open-engine`. Stripping only the legacy block leaves a dangling call and an upstream-targeted installer.
+These auto-merged to upstream's `@covibes → @the-open-engine` redirect; no conflict marker flags them. The redirect is not isolated to the legacy-distro block — `getUpdateTarget()` calls `isLegacyDistro(packageName)` (~177) and `buildInstallArgs` pushes `NEW_PACKAGE_SPEC` (~198), so the _kept_ install path itself installs `@the-open-engine`. Stripping only the legacy block leaves a dangling call and an upstream-targeted installer.
 
 - `cli/lib/update-checker.js`:
   - Repoint the package constants to the fork: `NEW_PACKAGE_NAME` (~18), `NEW_PACKAGE_SPEC` (~20), `REGISTRY_URL` (~29) → `@covibes/zeroshot` / default npm registry. (Or collapse the legacy/new split entirely to a single `@covibes` target.)
@@ -169,16 +181,20 @@ git add package-lock.json
 - [ ] **Step 11: Skip-tag the one deferred test; assert auto-merged behaviors survived**
 
 Skip-tag (Task 2 re-ports context compression). **TWO `it()` blocks** in `tests/cannot-validate-status.test.js` fail under the upstream `--theirs` render — skip BOTH:
+
 - the header block (~242, asserts `'SKIP — Unverifiable Criteria'`; upstream renders `'Permanently Unverifiable Criteria'`)
 - the dedup block (~301, its `/- AC1:/g` matches 0 because upstream renders bolded `- **AC1**:`)
 
 The dedup failure is format-driven (bold vs un-bold) and is **part of the deferred compression** — do NOT "fix" it inside Task 0 (e.g. by un-bolding `agent-context-sections.js`); that would leak Task 2's re-port. Skip both, un-skip both in Task 2.
+
 ```bash
 # in tests/cannot-validate-status.test.js, on each of the two it() blocks:
 #   // TODO(merge/v6.2.0 Task 2): re-port context compression, then un-skip
 #   it.skip(...)
 ```
+
 Assert (no edits — these must already be true post-merge; if any is empty the auto-merge dropped a fork behavior, STOP and union it by hand):
+
 ```bash
 git grep -c '_warnedLevelUpgrades' -- src/providers/base-provider.js          # >0
 git grep -cE 'ZEROSHOT_TRACK_SUBAGENTS|CLAUDE_AUTOCOMPACT_PCT_OVERRIDE' -- src/agent/agent-task-executor.js  # >0
@@ -193,6 +209,7 @@ npm ci
 npm run build:agent-cli-provider
 npm run lint && npm test
 ```
+
 Expected: PASS (only the Task-2-tagged skip). A non-skipped failure is a genuine merge defect — fix before committing.
 
 - [ ] **Step 13: Commit the merge**
@@ -208,10 +225,12 @@ git add -A && git commit --no-edit
 Upstream runs hook/transform scripts via string interpolation `vm.runInContext('(function(){ ' + script + ' })()', ctx)` (CodeQL-flagged injection seam). The fork compiles the body with `vm.compileFunction(script, [], { parsingContext: ctx })`, so wrapper-breakout payloads are a SyntaxError. Re-port the fork seam; prove it with a payload that the interpolation form executes but `compileFunction` rejects.
 
 **Files:**
+
 - Modify: `src/agent/agent-hook-executor.js` (`runTransformScript` ~line 296, `evaluateHookLogic` vm block ~line 690 in the merged/upstream file)
 - Test: `tests/unit/hook-logic-executor.test.js` (add a case)
 
 **Interfaces:**
+
 - Consumes: merged (upstream) `agent-hook-executor.js`; exports `{ executeHook, executeTransform, substituteTemplate, evaluateHookLogic, deepMerge }`.
 - Produces: both vm seams use `vm.compileFunction(script, [], { parsingContext: vmContext })` + `vm.runInContext('__fn()', vmContext, { timeout })`.
 
@@ -247,6 +266,7 @@ Expected: FAIL — upstream's interpolation executes the injected IIFE and retur
 - [ ] **Step 3: Re-port the compileFunction seam**
 
 In `runTransformScript`, replace the interpolation block with:
+
 ```javascript
 const vmContext = vm.createContext(sandbox);
 try {
@@ -256,6 +276,7 @@ try {
   throw new Error(`Transform script error: ${err.message}`);
 }
 ```
+
 In `evaluateHookLogic`'s vm block, the same with `logic.script` and `{ timeout: 1000 }`, throwing `Hook logic script error: ...`. Remove the now-dead `wrappedScript` lines and the `codeql[js/bad-code-sanitization]` suppression comments.
 
 **Convert BOTH seams.** `runTransformScript` (~296) and `evaluateHookLogic` (~690) each use the interpolation wrapper. The breakout test only drives `evaluateHookLogic` (the production transform path runs through async `executeTransform` + result-validation, which is awkward to unit-test directly), so guard the transform seam structurally — see Step 4. (Note: `compileFunction` produces a non-strict function body, vs upstream's `'use strict'` wrapper. This faithfully restores the fork's original behavior — no test depends on strict-mode semantics and globals still resolve to the sandbox — so do not "fix" it back.)
@@ -266,6 +287,7 @@ Run: `npx mocha tests/unit/hook-logic-executor.test.js tests/transform-sandbox-l
 Expected: PASS (new breakout test green; existing sandbox/ledger tests still green).
 
 Structural guard against a partial re-port (the transform seam has no behavioral test):
+
 ```bash
 git grep -c 'compileFunction' -- src/agent/agent-hook-executor.js   # expect 2 (both seams)
 git grep -c 'wrappedScript'   -- src/agent/agent-hook-executor.js   # expect 0 (no interpolation left)
@@ -285,10 +307,12 @@ git commit -m "feat: re-port compileFunction VM-sandbox hardening onto v6.2.0 ho
 `agent-context-builder.js` was a real conflict resolved `--theirs` in Task 0, dropping the fork's f9ddd7a compression (terse headers, compact `MM-DD HH:MM` timestamps, un-indented `JSON.stringify`). Re-port it into wherever upstream now renders sections. `guidance-queue.js` and `sub-cluster-wrapper.js` auto-merged with their compression intact — do NOT touch them.
 
 **Files:**
+
 - Modify: the upstream module that renders context sections — confirm in Step 3 (upstream split rendering out of `agent-context-builder.js`; likely `src/agent/agent-context-sections.js` and/or `agent-context-sources.js`)
 - Test: `tests/cannot-validate-status.test.js` (un-skip)
 
 **Interfaces:**
+
 - Consumes: merged (upstream) pack/section/source context modules. The rendering f9ddd7a compressed now lives in `src/agent/agent-context-sections.js` and `src/agent/agent-context-sources.js` (upstream split it out of `agent-context-builder.js`).
 - Produces: rendered prompt output uses terse headers (no markdown bold/emoji), compact `MM-DD HH:MM` timestamps, and un-indented JSON. **Note:** `tests/cannot-validate-status.test.js` only asserts ~2 of the ~7 compression targets (the `SKIP — Unverifiable Criteria` header and un-bolded `- AC1:` dedup line); the rest are guarded by the Step 4 zero-greps, not the test.
 
@@ -306,6 +330,7 @@ Expected: FAIL — upstream renders verbose `Permanently Unverifiable Criteria` 
 ```bash
 git show f9ddd7a:src/agent/agent-context-builder.js   # fork original — note ALL 7 compressed functions
 ```
+
 f9ddd7a compressed ~7 section builders (e.g. `buildGitOperationsSection`, autonomous-mode, output-density, JSON-output sections, plus schema/Data JSON serialization and `MM-DD HH:MM` timestamps). In the merged tree these are arrays of indented quoted string literals inside `agent-context-sections.js`/`agent-context-sources.js` (so a `^#{1,3} ` header grep matches nothing — use the f9ddd7a diff as the checklist). Apply to each: terse headers (drop emoji/`**`), `MM-DD HH:MM` timestamps, `JSON.stringify(x)` with no indent.
 
 - [ ] **Step 4: Run to confirm green + assert full coverage**
@@ -314,12 +339,14 @@ Run: `npx mocha tests/cannot-validate-status.test.js`
 Expected: PASS.
 
 Coverage guard (the test only gates ~2 targets) — expect ZERO after re-port:
+
 ```bash
 git grep -nE 'toISOString|JSON\.stringify\([^)]*, *null, *2\)|🔴|🚫|⚠️|\*\*' -- \
   src/agent/agent-context-sections.js src/agent/agent-context-sources.js
 # any hit = a verbose renderer not yet compressed
 ```
-**Do NOT add a `## ` markdown-header branch.** f9ddd7a *retains* `## ` section headers (e.g. terse `## AUTONOMOUS MODE`, `## OUTPUT DENSITY`) — it strips emoji/bold/timestamps/JSON-indent, not headers. A `## ` grep can never reach zero and would tempt stripping headers, breaking the section-delimiter lookahead `(?=\n## |$)` that `tests/cannot-validate-status.test.js:645` exercises. The `\*\*` branch above DOES reach zero (f9ddd7a removes markdown bold like `**NEVER**` → terse `FORBIDDEN:`), closing the bold-removal coverage gap.
+
+**Do NOT add a `## ` markdown-header branch.** f9ddd7a _retains_ `## ` section headers (e.g. terse `## AUTONOMOUS MODE`, `## OUTPUT DENSITY`) — it strips emoji/bold/timestamps/JSON-indent, not headers. A `## ` grep can never reach zero and would tempt stripping headers, breaking the section-delimiter lookahead `(?=\n## |$)` that `tests/cannot-validate-status.test.js:645` exercises. The `\*\*` branch above DOES reach zero (f9ddd7a removes markdown bold like `**NEVER**` → terse `FORBIDDEN:`), closing the bold-removal coverage gap.
 
 - [ ] **Step 5: Commit**
 
@@ -335,9 +362,11 @@ git commit -m "perf: re-port agent-context prompt compression onto v6.2.0 contex
 The quality-gate agent block has only `id`/`role`/`condition`/`triggers` — **no label/description field to rename**. The actual human-facing strings are the `quality_gate` param `description` fields and the runner's stdout. Machine identifiers stay.
 
 **Files:**
+
 - Modify: `cluster-templates/base-templates/full-workflow.json` (param `description` ~line 51), `cluster-templates/base-templates/worker-validator.json` (~line 36), `cluster-templates/base-templates/code-review-workflow.json` (~line 58), `scripts/quality-gate-runner.js` (stdout log lines), `cli/index.js` (~line 224 first-run confirmation string)
 
 **Interfaces:**
+
 - Consumes: merged templates (quality_gate param present via auto-merge).
 - Produces: the `quality_gate` param `description` strings + the runner's stdout label read "pre-validation gate"; `quality_gate` key, role id `quality-gate`, `--skip-quality-gate`, `.zeroshot-quality` all unchanged. **Scope is param descriptions + runner stdout only** — the higher-visibility `## QUALITY GATE FAILURES` prompt headings and the code-review stopper's `Quality gate failed …` stderr are intentionally left (renaming them risks coupling to the `QUALITY_GATE_FAILED` topic id); revisit only if you want full user-facing consistency.
 
@@ -352,6 +381,7 @@ git grep -cE '"quality_gate"|"role": *"quality-gate"' -- cluster-templates/base-
 git grep -c 'skip-quality-gate' -- cli/index.js          # cli/index.js:2 (flag literal lives here only)
 git grep -c 'skipQualityGate' -- lib/start-cluster.js    # >0 (start-cluster uses the camelCase var, not the flag)
 ```
+
 Expected: each >0. (Don't grep `skip-quality-gate` against `start-cluster.js` — it uses `skipQualityGate`/`quality_gate`, and a multi-file `git grep -c` hides zero-match files.)
 
 - [ ] **Step 3: Run the gate suites**
@@ -375,10 +405,12 @@ git commit -m "docs: rename fork quality gate to 'pre-validation gate' (human-fa
 **This prompt IS tested.** `tests/structuredOutput-mapping.test.js` calls `generateGitPusherAgent('github')` and asserts the prompt `.includes(...)` for THREE de-escalation-sensitive prose strings — `'TRANSPORT-ONLY GIT PUSHER'`, `'Do NOT edit source files'` (~line 138), and `'Do NOT inspect CI logs to debug product code'` (~line 139) — plus `'blocked_reason'` (an unchanged field id). All three prose strings get reworded by Step 2's `Do NOT`→`Do not` / CAPS rule, so all three assertions must be updated in lockstep. That test is the regression anchor (the prior "no test covers prompt text / add a tripwire" claim was wrong).
 
 **Files:**
+
 - Modify: `src/agents/git-pusher-template.js`
 - Modify (same commit): `tests/structuredOutput-mapping.test.js` (update the prompt-substring assertions to the reworded text)
 
 **Interfaces:**
+
 - Consumes: merged (upstream) `git-pusher-template.js`.
 - Produces: same prompt semantics, compressed and de-escalated (no redundant emphasis/repetition, no ALL-CAPS shouting or alarm emojis); `verify_pull_request` action and `SHARED_TRIGGER_SCRIPT` behavior preserved.
 
@@ -396,9 +428,11 @@ Edit only human-prose prompt strings: remove redundant emphasis/repetition AND r
 - [ ] **Step 3: Update the assertions + verify**
 
 Update `tests/structuredOutput-mapping.test.js`'s three reworded prompt-substring assertions — `'TRANSPORT-ONLY GIT PUSHER'`, `'Do NOT edit source files'` (~138), `'Do NOT inspect CI logs to debug product code'` (~139) — to the de-escalated text; keep `'blocked_reason'` (an unchanged field id) and leave the negative/schema assertions intact. Then:
+
 ```bash
 npx mocha tests/structuredOutput-mapping.test.js tests/verify-github-pr-hook.test.js
 ```
+
 Expected: PASS. And `git grep -c 'verify_pull_request' -- src/agents/git-pusher-template.js` unchanged. De-escalation check: `git grep -coE '⚠|🔴|🚨|❌|💡' -- src/agents/git-pusher-template.js` → 0 (identifier-style CAPS may remain).
 
 - [ ] **Step 4: Commit**
@@ -415,25 +449,29 @@ git commit -m "perf: re-compress + de-escalate git-pusher template prompt on v6.
 **Scope correction (verified):** the fork's `b5e636a` compression on the shared base templates **survived the merge intact** (nothing to re-apply — that part is a no-op), and the fork **never de-escalated** these templates (alarm-emoji counts are identical in fork `main` and the merged tree: full-workflow 45, worker-validator 5, debug-workflow 35, heavy-validation 19). So this task is **net-new de-escalation**, not a re-port: rewrite ALL-CAPS shouting + alarm emojis into plain declarative instructions, preserving semantics. Rationale: Anthropic research that high-alarm/emotional prompt framing is a distinct learned feature, not a reliability lever — https://www.anthropic.com/research/emotion-concepts-function and https://transformer-circuits.pub/2026/emotions/index.html.
 
 **Files:**
+
 - Modify: `cluster-templates/base-templates/full-workflow.json`, `worker-validator.json`, `debug-workflow.json`, `heavy-validation.json`, `quick-validation.json`
 
 **Interfaces:**
+
 - Consumes: merged shared templates (compression already intact).
 - Produces: de-escalated prompt/description strings (plain declarative tone, no alarm emojis); all template keys/params/topics unchanged.
 
 - [ ] **Step 1: Inventory the emphasis to remove**
 
 Count **occurrences**, not lines — these system prompts are single giant JSON-string lines packing many emojis each, so `git grep -c` (lines) reports ~6× fewer than exist:
+
 ```bash
 for f in full-workflow worker-validator debug-workflow heavy-validation quick-validation; do
   echo "$f: $(grep -oE '⚠️|🔴|🚨|❌|💡|🚫' cluster-templates/base-templates/$f.json | wc -l)"
 done   # expect non-trivial counts (full-workflow 45, worker-validator 5, debug-workflow 35, heavy-validation 19, quick-validation 8)
 ```
+
 (Do NOT `git diff b5e636a..HEAD` to "find losses" — that surfaces upstream's deliberate structural changes (level2→level3, FIX_APPLIED→IMPLEMENTATION_READY, etc.) as if they were regressions, inviting a worker to revert the merge.)
 
 - [ ] **Step 2: Rewrite alarm emphasis to plain declaratives**
 
-Rewrite ALL-CAPS shouting + alarm emojis into plain declarative instructions; leave structure, keys, params, topics, prompt *meaning*, and identifier-style CAPS (topic/action names like `IMPLEMENTATION_READY`, `QUALITY_GATE_FAILED`) untouched. This is semantic-preserving tone editing only.
+Rewrite ALL-CAPS shouting + alarm emojis into plain declarative instructions; leave structure, keys, params, topics, prompt _meaning_, and identifier-style CAPS (topic/action names like `IMPLEMENTATION_READY`, `QUALITY_GATE_FAILED`) untouched. This is semantic-preserving tone editing only.
 
 - [ ] **Step 3: Verify templates parse + resolve + pass**
 
@@ -442,9 +480,11 @@ node -e "for(const f of ['full-workflow','worker-validator','debug-workflow','he
   JSON.parse(require('fs').readFileSync('cluster-templates/base-templates/'+f+'.json','utf8'))"  # valid JSON
 npx mocha tests/template-resolver.test.js tests/quality-gate.test.js
 ```
+
 Expected: PASS (templates parse and resolve; placeholders/params intact).
 
 Completion gate (none of the above asserts tone — mirror Task 4's de-escalation check; the deliverable is otherwise unverified):
+
 ```bash
 for f in full-workflow worker-validator debug-workflow heavy-validation quick-validation; do
   echo "$f: $(grep -oE '⚠️|🔴|🚨|❌|💡|🚫' cluster-templates/base-templates/$f.json | wc -l)"
@@ -479,7 +519,9 @@ for m in command-proofs agent-command-proofs-context agent-quality-gates-context
   [ -n "$hits" ] && echo "$m: $hits" || echo "$m: ORPHAN"
 done
 ```
+
 Expected: each lists ≥1 importer, none print `ORPHAN`. (`pr-verification` and `simulate-random-topology` are single-importer — `agent-hook-executor.js` and the union `template-validation/index.js` respectively — so a dropped `require` from the Task-1/Task-0 edits shows up here.) For `quality-gates`, which has multiple importers (orchestrator.js, git-pusher-template.js, agent-quality-gates-context.js), additionally assert the union seam specifically:
+
 ```bash
 git grep -n "require('./quality-gates')" -- src/orchestrator.js   # >0
 ```
@@ -490,6 +532,7 @@ git grep -n "require('./quality-gates')" -- src/orchestrator.js   # >0
 npm run build:agent-cli-provider
 node -e "require('./src/orchestrator');require('./src/agents/git-pusher-template');require('./src/agent/agent-hook-executor');require('./src/providers')"
 ```
+
 Expected: no throw.
 
 - [ ] **Step 4: Identity + rename + TUI greps (scoped)**
@@ -503,6 +546,7 @@ git grep -l the-open-engine -- src/   # expect ONLY src/agent-cli-provider/{inde
 git grep -n verify_github_pr -- src                          # zero
 git grep -nE 'tui-launcher|launchTuiSession' -- src cli lib   # zero
 ```
+
 (Do NOT grep bare `task-lib/tui` repo-wide — upstream's `eslint.config.mjs` legitimately lists `task-lib/tui.js` ignore globs.) The `src/agent-cli-provider/{index,types}.ts` + `strict-lane.test.ts` hits on `the-open-engine` are **intentional and dormant**: `agentCliProviderHelperMetadata.packageName` is an internal compile-time contract value never read at runtime (the build is plain `tsc`; `src/providers/index.js` consumes the adapters, not this metadata). Per the LOCKED "adopt agent-cli-provider" decision, leave them as upstream's internal contract — do not repoint (the literal type at `types.ts:9`, the value, and the `strict-lane.test.ts:26` assertion are coupled and would all have to change together for zero functional gain).
 
 - [ ] **Step 5: Full build + lint + test**
@@ -517,6 +561,7 @@ zeroshot tui ; zeroshot watch     # each prints "The TUI is not included in this
 npx mocha tests/unit/command-proofs.test.js tests/context-replay-policy.test.js \
   tests/unit/gc-orphan-protection.test.js
 ```
+
 (Correct paths: `command-proofs` and `gc-orphan-protection` live under `tests/unit/`.) The stub's non-zero exit is expected — treat the printed "TUI is not included" message as success, not the exit code. The `--skip-quality-gate → quality_gate:false` path is covered by the quality-gate unit tests — do NOT launch a real `zeroshot run`.
 
 - [ ] **Step 7: Push + open PR**

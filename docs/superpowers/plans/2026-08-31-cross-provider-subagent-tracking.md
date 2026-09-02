@@ -1,5 +1,11 @@
 # Cross-Provider Subagent Tracking Implementation Plan
 
+> **Superseded on 2026-09-02:** Do not execute this plan. Its Codex JSON-stream
+> observer and broad activation model were explicitly rejected during v6.46
+> reconciliation. Use
+> `docs/superpowers/plans/2026-09-02-cross-provider-subagent-visibility.md`;
+> this file remains only as PR 31 prior art.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Display direct Claude Code and Codex subagents in Zeroshot's status footer for normal and isolated cluster-agent runs.
