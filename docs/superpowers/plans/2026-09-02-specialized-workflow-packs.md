@@ -22,8 +22,11 @@
 - Keep a conservative fixed batch instruction; test its resolved prompt and do
   not claim hard runtime enforcement. Do not inject
   `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` or implement adaptive concurrency.
-- `--output` is accepted only for a fully resolved config declaring one Markdown artifact and is distinct from `--result-file`.
-- `--output` provides crash-safe replacement for the caller-selected path; it
+- `--output` requires one Markdown artifact: direct configs validate fully at
+  launch, while conductors validate the entry contract at launch and seal the
+  selected binding after `load_config`. It is distinct from `--result-file`.
+- `--output` provides process-crash-recoverable atomic replacement for the
+  caller-selected path; power-loss durability is explicitly excluded in Task 5. It
   is not a sandbox against a concurrently malicious same-UID process replacing
   ancestor directories. Do not add `lstat`/`realpath` checks that merely narrow
   but cannot close that race. A stronger threat model requires a separate
@@ -54,15 +57,23 @@
 - Produces config declaration `artifacts: [{ id: string, mediaType: 'text/markdown', sourceTopic: string }]`.
 - Produces params `max_iterations: integer >= 1`, `batch_limit: integer >= 1`, `preflight_quality_gate: boolean`.
 - Produces `resolveSingleMarkdownArtifact(config): WorkflowArtifactDeclaration | null`.
+- Produces `validateArtifactEntryContract(entryConfig):
+ValidatedArtifactEntryContract` for conductor phase one. It checks only one
+  Markdown root declaration and compatibility with the entry's declared family;
+  it neither requires a selected final operation nor creates a sealed binding.
 - Produces `validateArtifactWorkflowConfig(resolvedConfig, registry):
-ValidatedArtifactBinding` before provider startup. It requires exactly one
+ValidatedArtifactBinding` for full binding before product-provider startup.
+  Direct packs call it before any provider; conductors call it on the selected
+  resolved config after `load_config` and before loaded agents. It requires exactly one
   reachable final operation for the sealed family, declaration `sourceTopic ===
 descriptor.successTopic`, policy `after_artifact_commit`, and no competing
   producer. The immutable binding carries artifact declaration, final operation
   ID, descriptor revision, and success topic into `WorkflowRuntime` and the
   writer; simulation models the registry-to-topic producer edge.
 - Produces immutable host-owned `WorkflowInstanceDescriptor` with workflow ID,
-  family, resolved-config revision, and sorted expected analyst/validator IDs.
+  family, resolved-config revision, resolved `maxIterations`, and sorted
+  expected analyst/validator IDs. The sealed value, not reconstructed config or
+  a default, controls every reducer branch after resume.
 - Direct packs atomically create it in `sealed` state during initial resolution.
   A conductor entry creates an `unfinalized` descriptor containing only run
   identity, family, and the root artifact contract; after `load_config`
@@ -73,6 +84,11 @@ descriptor.successTopic`, policy `after_artifact_commit`, and no competing
   is never authoritative.
   A second/different seal or later topology mutation fails closed, and no
   workflow operation may run while the descriptor is unfinalized.
+- Every conductor success and error/fallback transform recovers the original,
+  non-republished `ISSUE_OPENED` row for its workflow instance from the ledger,
+  requires nonempty issue text, and aborts before `load_config` or republication
+  when it is unavailable. A fallback may select a conservative tier, but may
+  never manufacture or republish an empty brief.
 - Produces `installWorkflowRuntime(sealedDescriptor, dependencies)`. Direct
   packs seal and install it before product agents start. Conductors may run only
   the bootstrap while unfinalized; `_opLoadConfig` seals and installs the
@@ -88,6 +104,13 @@ descriptor.successTopic`, policy `after_artifact_commit`, and no competing
   immutable artifact contract as its dynamically loaded base. Dynamic loading
   validates equality; it must not silently discard or replace the entry
   contract.
+- For conductor `--output`, the CLI first captures and persists the absolute
+  invocation-relative path after `validateArtifactEntryContract` and before
+  detach. After `load_config`, `_opLoadConfig` calls
+  `validateArtifactWorkflowConfig` for the selected final operation and equal
+  artifact contract, then seals the binding before adding loaded product agents
+  or replaying the original issue. Only the bootstrap conductor may run between
+  these phases.
 
 - [ ] **Step 1: Add failing declaration validation tests**
 
@@ -151,6 +174,7 @@ export type WorkflowInstanceDescriptor =
       readonly artifact: WorkflowArtifactDeclaration;
       readonly descriptorRevision: string;
       readonly configRevision: string;
+      readonly maxIterations: number;
       readonly expectedAnalystIds: readonly string[];
       readonly expectedValidatorIds: readonly string[];
     };
@@ -236,9 +260,11 @@ Resolve the base with `{ max_iterations: 3, batch_limit: 2,
 preflight_quality_gate: true }`. Assert Bell/Book/Candle analysts are present,
 the resolved prompt instructs the orchestrating LLM to issue at most two
 specialist assignments per batch, all candidate, analyst-complete, and
-validation topics are consumed by the host round coordinator, and the single
-synthesizer invokes the operation only from the coordinator-owned ready topic
-using exactly:
+validation topics are consumed by the host round coordinator, and the sealed
+descriptor stores `maxIterations: 3`. Assert every finding requires the whole
+sealed validator set, with no model-authored per-finding assignment. The single
+synthesizer invokes the operation only from the coordinator-owned terminal
+ready topic using exactly:
 
 ```json
 {
@@ -254,8 +280,16 @@ Assert no trigger has `command`, `cwd`, `env`, `onSuccess`, or
 Each expected analyst emits a schema-checked round-complete envelope, including
 an empty finding set. The provider-free `ReviewRoundCoordinator` from the
 operations plan consumes progress serially, waits for the sealed analyst and
-validator sets, freezes the snapshot, and compare-and-set claims one
-round-scoped execution. It emits `REVIEW_ROUND_READY` exactly once. The
+validator sets, first freezes the analyst candidate set, and closes zero
+findings without validator work. For nonempty findings it persists an absolute
+participant deadline plus terminal `completed`/`failed`/`timed_out` states,
+freezes the snapshot, and compare-and-set claims one round-scoped transition.
+Failure or expiry converts missing participation into a contested host-owned
+outcome rather than an unbounded wait. Rounds are one-based. Contested work
+below the sealed cap emits `REVIEW_REFINEMENT_READY` exactly once;
+`WorkflowRuntime` consumes it by atomically creating round `n + 1` and its
+sealed-set assignments, keyed by the consumed row so replay cannot dispatch
+twice. A resolved result or the cap emits `REVIEW_ROUND_READY` exactly once. The
 synthesizer is the only consumer allowed to invoke `review.synthesize`; it has
 no `pending` path and uses the claimed execution key. Duplicate/late progress
 messages reuse the stored disposition, so only one invocation can emit the
@@ -308,7 +342,11 @@ gate configuration.
 Bell, Book, and Candle retain distinct review concerns and the conductor routes
 explicitly to them. Require each assignment to include a terse `description`
 or `task_name` in its prompt contract for later telemetry, without depending on
-telemetry for correctness.
+telemetry for correctness. In both success and error/fallback transforms,
+select the original non-republished `ISSUE_OPENED` row for this workflow,
+require nonempty issue text, and abort rather than calling `load_config` or
+republishing an empty brief. Test conductor failure with present and absent
+original issue text.
 
 - [ ] **Step 6: Validate and simulate the family**
 
@@ -506,7 +544,8 @@ git commit -m "feat: restore bounded document drafting workflows"
 
 - Produces `resolveArtifactOutputPath(input, invocationCwd): string` and an
   idempotent host-side `commitMarkdownArtifact({ destination, markdown,
-checksum, artifactSequence })`.
+checksum, artifactSequence, commitClaim, signal })`. The terminal coordinator,
+  not the caller, issues and fences `commitClaim` and owns the abort signal.
 - Persists `artifactOutputPath`, artifact binding, phase, and cursor in ledger
   `workflow_state` within the same state/message transaction; cluster state may
   expose only a derived diagnostic summary.
@@ -525,15 +564,26 @@ assert.strictEqual(resolveArtifactOutputPath('/tmp/review', '/repo'), '/tmp/revi
 ```
 
 Use platform-aware path fixtures on Windows. Reject empty paths, directories,
-NUL, and incompatible configs before provider startup. Assert `--result-file`
-remains a separate foreground benchmark option.
+NUL, and incompatible direct/root configs before provider startup. For conductors, assert
+phase one uses `validateArtifactEntryContract` and persists the absolute pending
+path before detach without asserting a final operation; phase two uses
+`validateArtifactWorkflowConfig` to validate the selected resolved final
+operation and seals the binding before loaded product-provider startup. Assert
+each validator rejects inputs belonging to the other phase. Assert
+`--result-file` remains a separate foreground benchmark option.
 
 - [ ] **Step 2: Add atomicity tests**
 
 Pre-create a destination with `old`. Simulate successful rename and each of:
 operation failure, cancellation, invalid artifact, multiple artifacts,
 temporary write failure, and rename failure. Assert success replaces with exact
-Markdown; every failure leaves `old` unchanged and no owned temp remains.
+Markdown; every pre-rename failure leaves `old` unchanged and no owned temp
+remains. Treat a post-rename receipt failure as a crash-recovery case below,
+not as a rollback claim.
+Race cancellation immediately before and during commit: the coordinator either
+terminalizes before granting the commit claim, or records abort and waits for
+the claim holder. The writer checks abort while holding the serialized claim
+immediately before rename; assert no rename occurs after a terminal row.
 
 - [ ] **Step 3: Add launch-mode persistence tests**
 
@@ -546,7 +596,11 @@ tests proving no generic completion agent can terminalize an artifact workflow.
 Add crash-window/resume cases: before temp write, after rename but before the
 commit receipt, after the receipt but before terminal publication, and during
 shutdown. Replaying the same READY checksum is idempotent; a mismatched checksum
-for the same artifact sequence fails closed.
+for the same artifact sequence fails closed. Before rename, persist COMMITTING
+with epoch/token, temp identity, artifact checksum, and the destination's
+preimage checksum or absence. On recovery, an artifact-checksum destination is
+completed by recording COMMITTED; a preimage match retries; any other content
+is preserved and fails closed as an ambiguous external edit.
 Add resume immediately after descriptor sealing, artifact READY, and
 `HANDOFF_PENDING`; assert runtime hydration completes before any agent rebuild
 or outbox delivery and uses the same path/binding/cursor.
@@ -572,8 +626,12 @@ export function resolveArtifactOutputPath(input: string, invocationCwd: string):
 ```
 
 For commit, create parents, open a sibling temp with `wx`/`0o600`, write the
-exact UTF-8 Markdown, sync/close, rename, and clean only that owned temp on
-failure. The configured `*_ARTIFACT_READY` operation event is nonterminal and
+exact UTF-8 Markdown, and sync/close. Under the terminal coordinator's fenced
+commit claim, persist COMMITTING with the destination preimage, check the shared
+abort signal immediately before rename, rename, and clean only that owned temp
+on pre-rename failure. Cancellation cannot publish terminal state while this
+claim is held; after rename the owner records COMMITTED before releasing it.
+The configured `*_ARTIFACT_READY` operation event is nonterminal and
 contains Markdown, checksum, artifact identity, and durable sequence. The
 awaited host owner first durably calls the cluster coordinator's
 `markArtifactReady`. Without `--output`, it validates exactly one declared
@@ -583,9 +641,16 @@ the coordinator to advance. With no delivery request, the accepted/committed
 transition asks it to succeed. With `--pr`/`--ship`, it instead atomically calls
 `enterHandoffPending` and relies on the already-subscribed protected pusher;
 artifact ownership never publishes success in that mode. Commit failure asks
-the same coordinator for the sole failure terminal. Resume rehydrates phase and scans through
-the stored cursor, replaying READY lacking ACCEPTED/COMMITTED. Cover both
-branches and every crash window.
+the same coordinator for the sole failure terminal. Resume rehydrates phase and
+scans through the stored cursor. READY without COMMITTING restarts commit;
+COMMITTING uses the destination/preimage checksum rules above; COMMITTED
+advances without rewriting. Cover both branches and every crash window.
+
+Scope tests and public claims to atomic replacement and process-crash recovery.
+Do not claim cross-filesystem power-loss durability: this MVP does not sync the
+containing directory after rename. Portable directory sync and its
+platform/filesystem matrix are an explicit follow-up, not a prerequisite for
+the reconciliation program.
 
 - [ ] **Step 6: Add CLI and persisted run option**
 
@@ -593,9 +658,12 @@ branches and every crash window.
 .option('-o, --output <file>', 'Atomically write the workflow Markdown artifact')
 ```
 
-Resolve after the fully parameterized config is loaded but before daemon or
-isolation cwd changes. Print `Artifact written: <absolute path>` only after
-successful rename. Do not write on failure terminal topics.
+For a direct pack, resolve and validate after parameter resolution and before
+daemon/provider/isolation startup. For a conductor, resolve the path and
+validate its root declaration before daemon/isolation startup, then validate
+and seal the selected loaded config before loaded product agents start. Print
+`Artifact written: <absolute path>` only after COMMITTED. Do not write on
+failure terminal topics.
 
 - [ ] **Step 7: Run output tests and broader lifecycle coverage**
 

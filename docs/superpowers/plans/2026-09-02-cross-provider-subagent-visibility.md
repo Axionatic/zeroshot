@@ -177,8 +177,14 @@ until an exact same-session root-caller link proves the child is direct. A
 non-root caller proves a descendant and is ignored; missing/conflicting links
 fail closed.
 
-Assert maximum stdin `64 KiB`, record `8 KiB`, event file `4 MiB`, active
-children `64` per parent, title `120` characters, and type/ID `128` characters.
+Assert maximum stdin `64 KiB`, record `8 KiB`, event file `4 MiB`, run event
+bytes `16 MiB`, parent files/locks `64`, active children `64` per parent, title
+`120` characters, and type/ID `128` characters. The run handle atomically
+reserves a parent slot before creating its file and append bytes before each
+write through a private durable quota record guarded by one cross-process
+`wx` lock. All writers acquire the run quota lock before a parent lock. A crash
+may strand a reservation, but exhaustion fails open for telemetry and no race
+can create another parent file/lock or exceed the byte cap.
 
 - [ ] **Step 3: Run and verify missing modules/bin**
 
@@ -192,31 +198,43 @@ Expected: FAIL.
 - [ ] **Step 4: Implement private paths and append**
 
 Create a run-owned directory with `0700` and files with `0600`. Serialize each
-file through a private `wx` lock with a bounded fail-open acquisition timeout.
+file through one non-blocking attempt to acquire a private `wx` lock; contention
+immediately drops that observational record.
 Open append/create without following symlinks where supported, then `fstat` the
 opened descriptor for owner, mode, and regular-file identity. Hold the lock for
-the cap check and complete bounded write; reject partial writes. The hook reads
-provider/parent/output from `ZEROSHOT_SUBAGENT_PROVIDER`,
-`ZEROSHOT_PARENT_AGENT_ID`, `ZEROSHOT_PARENT_INVOCATION_ID`, and
-`ZEROSHOT_SUBAGENT_EVENTS_FILE`; it never reads transcript paths.
+the cap check and complete bounded write; reject partial writes. The hook derives
+provider/event only from its fixed validated command arguments and reads
+parent/output from `ZEROSHOT_PARENT_AGENT_ID`,
+`ZEROSHOT_PARENT_INVOCATION_ID`, and `ZEROSHOT_SUBAGENT_EVENTS_FILE`; it never
+reads transcript paths.
 
+Each configured command passes fixed provider and event arguments to the common
+executable; output selection never depends on telemetry environment validation.
 The executable exits `0` for invalid/unavailable telemetry so it cannot affect
-the provider. It writes nothing to stdout or stderr in normal operation.
+the provider. On every exit-0 Codex `SubagentStop` path it writes exactly `{}`
+plus a newline, even when parsing, validation, quota, locking, or writing failed;
+response generation is independent of telemetry acceptance. Every other
+successful path writes nothing to stdout or stderr. It never emits a
+block/continue decision.
 
 - [ ] **Step 5: Implement complete-record tracking**
 
 Maintain exactly one event file and lock per parent; invocation identity lives
 only in records. Advance the byte offset only through the final newline. Key state by provider,
 parent, invocation, and child. Upsert a repeated `start` so a later safely
-correlated title enriches the existing child. Ignore unknown stops.
+correlated title enriches the existing child. A valid Codex stop for an unknown
+child creates a bounded pending tombstone because its async start may still be
+in flight; ordinary unknown stops are ignored. Tombstone overflow disables that
+invocation until its durable terminal boundary rather than admitting a delayed
+phantom start.
 `finishInvocation(parentId, invocationId)` closes residual children but permits
 a later provider task; `finishParent(parentId)` seals every invocation only at
 final agent stop. Consumer-observable corruption or cap exhaustion disables the
 parent and closes its rows. A silent fail-open lock/write failure cannot be
 observed by the tracker; its truthful bound is eventual closure at the durable
 `TASK_COMPLETED`/`TASK_FAILED` boundary or final parent stop. Test both paths.
-This keeps total files bounded by parent count and total retained bytes bounded
-by configured parents times the per-file cap.
+This keeps files, locks, and retained bytes within the fixed run-wide bounds
+even when `add_agents` expands the topology.
 
 - [ ] **Step 6: Build and run event tests**
 
@@ -259,9 +277,40 @@ git commit -m "feat: add bounded subagent lifecycle sink"
 **Interfaces:**
 
 - Extends `prepareClaudeSettingsOverlay` with optional owned `subagentTelemetry` paths/env.
+- Produces durable `TaskAttemptBinding { clusterId, parentAgentId, attemptKey,
+taskId }` before provider launch and one watcher-owned settlement:
+
+```ts
+type TaskSettlement =
+  | {
+      taskId: string;
+      iteration: number;
+      success: true;
+      output: string;
+      tokenUsage: TokenUsage | null;
+    }
+  | {
+      taskId: string;
+      iteration: number;
+      success: false;
+      reason: 'failed' | 'cancelled' | 'terminated';
+      error: { code: string; message: string };
+    };
+```
+
+Error code/message use the existing bounded task diagnostic limits. Both
+watcher variants persist this union; it is the only lower-runner result
+consumed by lifecycle. Lifecycle publishes it through the existing
+`MessageBus.publishIfAbsent` ledger transaction using deterministic ID
+`task-terminal:<clusterId>:<parentAgentId>:<taskId>`; duplicate/replayed
+settlement returns the recorded row and never notifies subscribers twice.
+
+- Produces in-memory `ClaudeHookCapabilityEvidence`
+  (`version_supported`, `version_unsupported`, `config_rejected`,
+  `handler_unavailable`, or `unknown`) for the exact executable being launched.
 - Injects the validated absolute host handler or constant absolute container
   handler for `SubagentStart`, `SubagentStop`, and `PostToolUse` matcher
-  `^Agent$` only when capability is enabled.
+  `^Agent$` only when run and Claude capabilities are enabled.
 - Creates the run telemetry root and Docker bind mapping before
   `_initializeIsolation`; provider runners receive only resolved paths/env.
 - The foreground CLI owns one idempotent resource handle across startup,
@@ -274,6 +323,11 @@ and safety hooks, and never write the user's source file. For every disabled
 reason, assert no telemetry hook, directory, file, mount, or env is created.
 Inject each telemetry-only preparation/mount failure and assert one warning,
 owned rollback, no hook/env/mount, and unchanged cluster/provider outcome.
+Pin supported, unsupported, malformed, and timed-out bounded no-provider
+version-probe fixtures. Negative or
+unknown evidence must omit the overlay. Simulate startup rejecting only the
+owned hook group and assert one retry without telemetry; unrelated startup
+failures are not retried. Evidence remains run-local and is never hydrated.
 
 - [ ] **Step 2: Add Claude title-correlation fixtures**
 
@@ -309,15 +363,23 @@ Expected: FAIL.
 
 - [ ] **Step 4: Merge only Zeroshot-owned hook groups**
 
-Use exact stable handlers:
+Use exact stable handlers with a one-second provider timeout:
 
 ```json
 {
   "type": "command",
-  "command": "<validated-absolute-handler>",
-  "timeout": 3
+  "command": "<validated-absolute-handler> --provider <fixed-provider> --event <fixed-event-name>",
+  "timeout": 1
 }
 ```
+
+Keep every Claude hook synchronous because headless sessions may kill unfinished
+async hooks. Keep Codex `SubagentStop` synchronous to return its event-specific
+JSON; configure Codex `SubagentStart` and `PostToolUse` with `async=true` so
+observational I/O cannot delay those operations. The handler performs no retry
+or wait for either the run-quota or parent lock. Add contended-lock regressions
+proving synchronous hooks exit successfully inside the provider timeout and
+Codex `SubagentStop` still returns `{}`.
 
 Do not copy arbitrary user hook shapes into a new global file. The existing
 overlay already contains the run's effective safe settings and is passed with
@@ -332,21 +394,36 @@ or mapping error, remove partial owned resources, warn once, and start normally
 without telemetry. Wrap startup, foreground streaming, and shutdown in one
 `try/finally` that always releases the handle; transfer no cleanup ownership.
 
-For enabled Claude only, pass the handle's mapping through one isolation
-augmentation helper used by the main container and
-`createValidatorIsolation` fallback:
+For Docker, consider telemetry only after the fully resolved configuration proves
+that its provider topology is closed (no `load_config`, `add_agents`, or other
+provider-extending path, including an `update_agent` provider mutation) and
+every possible parent is Claude. A dynamic/mixed
+provider topology returns a closed disabled reason before container creation;
+do not add ACL/chown or per-agent-container machinery. Create an eligible
+candidate with the mounts, then before provider startup run a bounded
+create/append/read/remove sentinel probe as that exact container user under its
+actual user-namespace mapping, and derive Claude capability evidence by probing
+the executable inside that candidate rather than reusing host evidence. If
+either probe fails, remove the candidate and retry once without telemetry. Use
+the same isolation augmentation helper independently for the main container and
+`createValidatorIsolation` fallback, probing the fallback's exact image and
+executable rather than reusing the main-container result:
 mount only the telemetry root writable and the exact current standalone hook
 read-only at a constant absolute container path. If Docker rejects only the
 telemetry mounts, remove the partial container and retry once without telemetry;
 unrelated Docker failures remain fatal. Containers cannot receive mounts later.
 
-`task-lib/runner.js` is the sole task-ID authority for both providers. Outer
-callers pass only frozen run/parent telemetry metadata. Immediately after
-`generateId()`, the runner validates that descriptor, creates the Claude
-overlay, and adds provider/parent/generated-task-ID/file values to the final
-`CommandSpec.env`; do not create another ID. Both watcher variants assert the
-same persisted ID. Use a validated absolute host handler normally and the
-constant mounted path in Docker. Preserve cross-UID checks.
+`task-lib/runner.js` is the sole task-ID authority for both providers. Lifecycle
+creates one unique attempt key before spawning the task command. Immediately
+after `generateId()`, the runner atomically persists
+`(clusterId, parentAgentId, attemptKey) -> taskId`, validates the telemetry
+descriptor, creates the Claude overlay, and adds parent/generated-task-ID/file
+values to the final `CommandSpec.env`; do not create another ID. Both watcher
+variants persist a typed settlement against that binding before returning.
+Lifecycle resolves/replays the binding and settlement by attempt key if the
+outer command exits before returning the ID. Use a validated absolute host handler normally and the
+constant mounted path in Docker. Preserve the proved access invariant at the
+final mount boundary.
 
 - [ ] **Step 6: Build and run Claude/isolation tests**
 
@@ -360,8 +437,11 @@ npm run lint
 
 Expected: PASS. Docker-unavailable integration is recorded as a skip.
 For Claude, the hermetic suite must still exercise validator platform-mismatch
-fallback and assert both telemetry mounts on that secondary container. For
-Codex, assert the Docker exclusion: no telemetry override, env, or mount.
+fallback and assert both telemetry mounts on that secondary container. Assert
+mixed-provider, provider-extensible, access-probe-failed, user-namespace-remapped,
+container-Claude-unsupported, fallback-image-mismatched, and Codex-only Docker
+runs have no telemetry override, env, or mount after retry. Assert a later
+provider-changing `update_agent` is rejected for a telemetry-mounted container.
 
 - [ ] **Step 7: Commit Claude production**
 
@@ -407,9 +487,9 @@ absence of overrides, handler paths, env, and mounts. The following uses a
 placeholder for the validated host value:
 
 ```toml
-hooks.SubagentStart=[{hooks=[{type="command",command="<absolute-handler>",timeout=3}]}]
-hooks.SubagentStop=[{hooks=[{type="command",command="<absolute-handler>",timeout=3}]}]
-hooks.PostToolUse=[{matcher="^spawn_agent$",hooks=[{type="command",command="<absolute-handler>",timeout=3}]}]
+hooks.SubagentStart=[{hooks=[{type="command",command="<absolute-handler> --provider codex --event SubagentStart",async=true,timeout=1}]}]
+hooks.SubagentStop=[{hooks=[{type="command",command="<absolute-handler> --provider codex --event SubagentStop",timeout=1}]}]
+hooks.PostToolUse=[{matcher="^spawn_agent$",hooks=[{type="command",command="<absolute-handler> --provider codex --event PostToolUse",async=true,timeout=1}]}]
 ```
 
 Assert the adapter emits each as `--config`, preserves existing config
@@ -518,12 +598,24 @@ git commit -m "feat: track Codex subagents through trusted hooks"
 
 - Modify: `src/status-footer.js`
 - Modify: `cli/index.js`
+- Modify: `src/subagent-tracker.ts`
+- Modify: `src/subagent-tracker.js`
+- Modify: `src/agent/agent-lifecycle.js`
+- Modify: `src/agent/agent-task-executor.js`
+- Modify: `src/orchestrator.js`
 - Modify: `tests/unit/status-footer.test.js`
 - Create: `tests/unit/cli-subagent-telemetry.test.js`
+- Modify: `tests/unit/watcher-crash-handling.test.js`
+- Modify: `tests/agent-task-not-found.test.js`
+- Modify: `tests/unit/agent-lifecycle-stop.test.js`
+- Modify: `tests/orchestrator.test.js`
 
 **Interfaces:**
 
-- Adds `StatusFooter.updateSubagent(event)` and `StatusFooter.finishParentSubagents(parentAgentId)`.
+- Adds `StatusFooter.replaceSubagentSnapshot(readonlySnapshot)` as a render-only
+  projection; it does not expose event or finish transitions.
+- Consumes the durable `TaskAttemptBinding` and `TaskSettlement` union produced
+  by Task 3; lifecycle never reconstructs settlement from free-form errors.
 - Child rows do not enter process metrics maps and count against the existing maximum footer rows.
 - The foreground CLI owns tracker polling, footer updates, final drain, and
   cleanup; the orchestrator exposes no footer reference and never renders.
@@ -531,21 +623,30 @@ git commit -m "feat: track Codex subagents through trusted hooks"
 - [ ] **Step 1: Add rendering and state tests**
 
 ```js
-footer.updateSubagent({
-  event: 'start',
-  provider: 'codex',
-  parentAgentId: 'analyst',
-  childAgentId: 'agent-42',
-  agentType: 'worker',
-  title: 'review release guard',
-});
+footer.replaceSubagentSnapshot([
+  {
+    provider: 'codex',
+    parentAgentId: 'analyst',
+    childAgentId: 'agent-42',
+    agentType: 'worker',
+    title: 'review release guard',
+    startedAt: '2026-09-02T00:00:00.000Z',
+  },
+]);
 const rows = footer.buildAgentRows(footer.executingEntries(), 100).map(stripAnsi);
 assert.ok(rows.some((row) => row.includes('review release guard')));
 assert.strictEqual(footer.interpolatedMetrics.has('agent-42'), false);
 ```
 
-Test stop, restart, parent finish, duplicate/late event, long title truncation,
-row cap, narrow terminal, and same child ID under different parents/providers.
+Test snapshot replacement, long title truncation, row cap, narrow terminal, and
+same child ID under different parents/providers. Test stop, restart, parent
+finish, duplicate/late event, and elapsed-start preservation only against
+`SubagentTracker`; the footer must not reproduce those transitions. Add an
+immutable `SubagentTracker.snapshot()` projection and bounded pending-stop
+tombstones so async Codex start/link records arriving after stop never create a
+phantom active row. Add an overflow regression with 65 valid unknown stops,
+delayed matching starts, terminal-boundary reset, and a subsequent invocation;
+assert no phantom row and suppression only for the overflowed invocation.
 
 - [ ] **Step 2: Add foreground CLI lifecycle tests**
 
@@ -557,9 +658,28 @@ parse, or cleanup throws. Pin final order: stop new provider launches, await
 parent task shutdown, poll complete records once, close invocations/parents,
 stop the footer, then remove only the owned telemetry root. Prove attach and
 `logs -f` cannot construct a tracker.
-Cover two sequential invocations, provider retry reuse of one task ID, startup
+Cover two sequential invocations, provider retries with distinct task IDs, startup
 failure, late records from task A after task B starts, and internal tasks that
 cannot publish a matching lifecycle boundary (telemetry disabled for them).
+For retries, assert each runner-allocated task ID gets its own terminal event
+and the failed attempt closes before the next task starts. Add lifecycle
+regressions proving failed attempts, settled cancellation, and forced
+termination each publish one durable `TASK_FAILED` before retry scheduling or
+any related final `AGENT_ERROR`/`CLUSTER_FAILED`/`STOPPED`. Lower task-executor
+status failures return a typed settlement and publish no `AGENT_ERROR` directly.
+Pin the closed payload fields and reason values.
+Cover an outer task command dying before returning its ID and assert lifecycle
+resolves the runner binding and replays its settlement. Cover bounded stop
+timeout without asserting task termination, and duplicate-ID replacement:
+`STOPPED` closes the old generation,
+then `STARTED` opens a new generation while late old invocation records remain
+rejected. Update every orchestrator stop/removal/replacement caller to pass its
+closed reason.
+Pin initialization cleanup, normal stop, kill, removal, and replacement
+reason/ordering in `tests/orchestrator.test.js`.
+Simulate duplicate settlement delivery and a crash after terminal publication
+but before caller acknowledgement; both replays must reuse the deterministic
+ledger row without a second subscriber delivery.
 
 - [ ] **Step 3: Run tests and verify missing footer support**
 
@@ -571,15 +691,27 @@ Expected: FAIL.
 
 - [ ] **Step 4: Integrate subordinate rows**
 
-Keep parent rows and current render lock/terminal degradation. Prefix child
+Keep parent rows and current render lock/terminal degradation. Replace the
+footer's child projection from each immutable tracker snapshot. Prefix child
 labels with an indented branch marker, display bounded title or agent type,
 and use start time for elapsed state. Do not add PID/CPU/RAM/network sampling
-for children.
+for children. Do not add footer-side event deduplication or lifecycle state.
+
+In `agent-lifecycle`, make provider-task settlement the sole publisher of one
+`TASK_COMPLETED` or `TASK_FAILED` per runner-generated task ID. Accept a closed
+settlement reason from task-executor kill/cancel/failure paths, remove their
+direct attempt-level `AGENT_ERROR` publications, and publish final logical
+errors only after task settlement. Extend `stop(agent, { reason, ... })` to
+publish idempotent `STOPPED` after the current task settles and before removal.
+On bounded shutdown expiry, publish `STOPPED` with `shutdown_timeout` without
+claiming task termination. Teach the tracker that a later durable `STARTED` for
+the same configured agent ID begins a new parent generation. Update the existing
+task-not-found, status-failure, and stop tests alongside these contracts.
 
 - [ ] **Step 5: Run footer and lifecycle tests**
 
 ```bash
-node tests/run-tests.js tests/unit/status-footer.test.js tests/unit/cli-subagent-telemetry.test.js tests/unit/watcher-crash-handling.test.js
+node tests/run-tests.js tests/unit/status-footer.test.js tests/unit/cli-subagent-telemetry.test.js tests/unit/watcher-crash-handling.test.js tests/agent-task-not-found.test.js tests/unit/agent-lifecycle-stop.test.js tests/orchestrator.test.js
 npm run typecheck
 npm run lint
 ```
@@ -589,7 +721,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit footer integration**
 
 ```bash
-git add src/status-footer.js cli/index.js tests/unit/status-footer.test.js tests/unit/cli-subagent-telemetry.test.js
+git add src/status-footer.js cli/index.js src/subagent-tracker.ts src/subagent-tracker.js src/agent/agent-lifecycle.js src/agent/agent-task-executor.js src/orchestrator.js tests/unit/status-footer.test.js tests/unit/cli-subagent-telemetry.test.js tests/unit/watcher-crash-handling.test.js tests/agent-task-not-found.test.js tests/unit/agent-lifecycle-stop.test.js tests/orchestrator.test.js
 git commit -m "feat: render direct subagents in status footer"
 ```
 

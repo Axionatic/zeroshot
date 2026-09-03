@@ -36,7 +36,8 @@
 
 **Interfaces:**
 
-- Produces `serializePromptJson(value: unknown): string`.
+- Produces `serializePromptJson(value: unknown): string | undefined` with native
+  `JSON.stringify` behavior.
 - Establishes the only approved compact serializer for JSON embedded in model prompts.
 
 - [ ] **Step 1: Add the pure serializer test**
@@ -49,8 +50,9 @@ assert.deepStrictEqual(JSON.parse(serialized), value);
 assert.doesNotMatch(serialized, /\n\s+"/);
 ```
 
-Assert unsupported values follow native `JSON.stringify` behavior and circular
-input throws; do not add a lossy fallback.
+Assert top-level `undefined`, functions, and symbols return `undefined`, while
+circular input throws; do not add a lossy fallback. Prompt call sites must
+retain their existing optional-value behavior.
 
 - [ ] **Step 2: Add a literal boundary inventory assertion**
 
@@ -85,14 +87,14 @@ Expected: FAIL on missing module/export.
 - [ ] **Step 4: Implement the pure boundary**
 
 ```ts
-export function serializePromptJson(value: unknown): string {
-  const serialized = JSON.stringify(value);
-  if (serialized === undefined) {
-    throw new TypeError('Prompt JSON value is not serializable');
-  }
-  return serialized;
+export function serializePromptJson(value: unknown): string | undefined {
+  return JSON.stringify(value);
 }
 ```
+
+Do not narrow the native return type with a throw. In particular, an absent
+legacy `prompt.outputFormat.example` must render as it did before this
+whitespace-only change.
 
 - [ ] **Step 5: Build and pass the pure test**
 
@@ -178,6 +180,10 @@ serializePromptJson(config.jsonSchema);
 Do this for output-format example/schema blocks, context-source `Data:`, queued
 guidance data, and output reformatter schema/raw output. Leave log/error
 serialization in the same files unchanged.
+Update `prompt-json-boundaries.test.js` for these migrated files: assert each
+named prompt boundary calls `serializePromptJson` and no longer uses a direct
+prompt-bound `JSON.stringify`. Keep explicitly identified diagnostic/protocol
+serializers allowed.
 
 - [ ] **Step 5: Build and run semantic tests**
 
@@ -193,7 +199,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit maintained prompt renderers**
 
 ```bash
-git add src/agent/agent-context-prompt-sections.ts src/agent/agent-context-prompt-sections.js src/agent/agent-context-sources.ts src/agent/agent-context-sources.js src/agent/guidance-queue.ts src/agent/guidance-queue.js src/agent/output-reformatter.ts src/agent/output-reformatter.js tests/context-injection.test.js tests/unit/guidance-queue.test.js tests/output-reformatter.test.js tests/unit/prompt-json-semantic-equivalence.test.js
+git add src/agent/agent-context-prompt-sections.ts src/agent/agent-context-prompt-sections.js src/agent/agent-context-sources.ts src/agent/agent-context-sources.js src/agent/guidance-queue.ts src/agent/guidance-queue.js src/agent/output-reformatter.ts src/agent/output-reformatter.js tests/context-injection.test.js tests/unit/guidance-queue.test.js tests/output-reformatter.test.js tests/unit/prompt-json-boundaries.test.js tests/unit/prompt-json-semantic-equivalence.test.js
 git commit -m "perf: minify embedded prompt JSON"
 ```
 
@@ -240,6 +246,9 @@ Expected: FAIL on indentation assertions.
 Replace only the JSON supplied inside provider prompts. Keep CLI arguments such
 as `--json-schema`, environment protocols, logs, debug errors, and cloned
 configuration serialization unchanged because they are not prompt formatting.
+Update the boundary inventory for these remaining migrated files using the same
+prompt-only rule; the final inventory describes serializer ownership after the
+refactor, not the pre-refactor direct calls.
 
 - [ ] **Step 5: Run provider/sub-cluster tests**
 
@@ -255,7 +264,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit final prompt boundaries**
 
 ```bash
-git add src/agent/agent-task-executor.js src/claude-task-runner.js src/sub-cluster-wrapper.js tests/claude-command.test.js tests/unit/task-runner-command-spec.test.js tests/nested-cluster.test.js tests/unit/isolated-mode-output-capture.test.js
+git add src/agent/agent-task-executor.js src/claude-task-runner.js src/sub-cluster-wrapper.js tests/claude-command.test.js tests/unit/task-runner-command-spec.test.js tests/nested-cluster.test.js tests/unit/isolated-mode-output-capture.test.js tests/unit/prompt-json-boundaries.test.js
 git commit -m "perf: compact provider prompt payloads"
 ```
 

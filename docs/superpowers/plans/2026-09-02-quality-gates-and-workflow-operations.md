@@ -320,6 +320,20 @@ receipts before any provider construction. The public worker request cannot set
 either bypass flag or supply a receipt. Add a protected handoff regression where both flags are
 true and `requiredQualityGates` is unchanged.
 
+Add pre-feature stopped-cluster fixtures with no receipt and with an obsolete
+receipt version. Resume must rerun the current preflight against the stored
+original canonical repository, atomically persist the new issued receipt, and
+only then rebuild agents. Interactive refusal and non-interactive inability to
+approve leave the cluster stopped and resumable; never synthesize or bless a
+legacy receipt.
+
+Define one host-owned `receiptAuthorizesStart(receipt, persistedRunPolicy)`
+predicate. It accepts `passed`; it accepts `skipped`, `missing_confirmed`, and
+`missing_allowed` only when the matching persisted policy still authorizes that
+outcome; and it rejects `failed`, `timed_out`, `cancelled`, and `launch_error`.
+Add current-version, matching-root/fingerprint fixtures for every status and
+prove a current but non-authorizing receipt cannot reach provider construction.
+
 - [ ] **Step 2: Run focused tests and verify failures**
 
 ```bash
@@ -350,6 +364,13 @@ derives policy from its registry-owned trusted profile, runs preflight locally,
 and issues an in-process receipt before `Orchestrator.start`. The orchestrator
 accepts only the module-private issued form or a receipt loaded by the owned
 run-state resolver before isolation/provider work.
+
+On resume, the owned resolver reuses only a current matching receipt for which
+`receiptAuthorizesStart` returns true. A current non-authorizing receipt, or a
+missing, legacy, unknown-version, stale-root, or stale-fingerprint state,
+invokes the same current preflight before any provider construction and
+replaces the receipt only with a newly issued, start-authorizing result. Failure
+preserves stopped state for a later resume.
 
 - [ ] **Step 4: Add typed private option/config propagation**
 
@@ -521,6 +542,7 @@ export interface WorkflowOperationContext {
     readonly family: 'code-review' | 'documentation-review' | 'document-draft';
     readonly descriptorRevision: string;
     readonly configRevision: string;
+    readonly maxIterations: number;
     readonly expectedAnalystIds: readonly string[];
     readonly expectedValidatorIds: readonly string[];
     readonly artifact: {
@@ -538,6 +560,13 @@ export type WorkflowOperationResult = {
   readonly state: 'ready';
   readonly content: { readonly text: string; readonly data: Record<string, unknown> };
 };
+
+export type OperationDisposition =
+  | { readonly disposition: 'inserted' | 'reused'; readonly messageId: string }
+  | {
+      readonly disposition: 'conflict';
+      readonly reason: 'semantic_input' | 'output_digest';
+    };
 
 export interface WorkflowOperationDescriptor {
   readonly allowedInputTopics: readonly string[];
@@ -607,13 +636,47 @@ may re-deliver a persisted pending outbox row; consumers deduplicate by its
 execution/message key. Snapshot-bounded reads remain operation inputs only.
 
 `WorkflowRuntime` is a provider-free cluster service over the sealed descriptor,
-registry, ledger state transaction, message bus, and family reducer. It exposes
-`claimReadyOperation(operationId, readyMessage)` and rejects a ready topic unless
-sender, deterministic ID, semantic key, digest, and frozen cursor match a
-durable host claim. It rehydrates unfinished claims and re-drives durable ready
-messages after agents subscribe on start/resume. This task implements and tests
-that generic shell with fixture reducers; Tasks 5 and 6 supply the real review
-and document reducers, and the workflow-pack Task 1 owns orchestrator attachment.
+registry, ledger state transaction, message bus, and family reducer. Its
+canonical claim interface is:
+
+```ts
+type ReadyOperationClaim =
+  | { readonly disposition: 'waiting' | 'terminal' }
+  | { readonly disposition: 'joined'; readonly completion: Promise<OperationDisposition> }
+  | { readonly disposition: 'reused'; readonly executionKey: string; readonly outboxMessageId: string }
+  | {
+      readonly disposition: 'claimed';
+      readonly executionKey: string;
+      readonly executionEpoch: number;
+      readonly ownerToken: string;
+      readonly reason: string;
+      readonly signal: AbortSignal;
+    };
+
+claimReadyOperation(
+  operationId: WorkflowOperationId,
+  readyMessage: WorkflowMessage
+): Promise<ReadyOperationClaim>;
+```
+
+The runtime resolves authorization from its sealed descriptor and rejects a
+ready topic unless sender, deterministic ID, semantic key, digest, and frozen
+cursor match a durable host claim. `executeWorkflowOperation`, joined
+completion, and `redriveClaimedResult` all return the exported
+`OperationDisposition`. It rehydrates unfinished claims and re-drives durable
+ready messages after agents subscribe on start/resume. This task implements and
+tests that generic shell with fixture reducers; Tasks 5 and 6 supply the real
+review and document reducers, and the workflow-pack Task 1 owns orchestrator
+attachment.
+
+Each claim stores `{ executionEpoch, ownerToken, phase, deadline }`. Only the CAS
+winner that moves `ready` to `executing` receives `claimed` and may invoke code.
+A duplicate live caller receives `joined` and awaits the process-local owner;
+a committed duplicate receives `reused` and re-drives/returns the stored outbox
+row. Neither disposition executes operation code. After a crash, recovery may
+increment the epoch and claim only once the prior deadline/abort is durably
+terminal; result publication requires the current epoch/token and fences late
+owners.
 
 - [ ] **Step 5: Wire the actual trigger dispatcher**
 
@@ -628,6 +691,22 @@ terminal state machine; use the runtime claim's bounded per-operation deadline
 and the ordinary cluster cancellation signal. Then call only:
 
 ```js
+const claimedExecution = await agent.cluster.workflowRuntime.claimReadyOperation(
+  trigger.operation,
+  message
+);
+
+if (claimedExecution.disposition === 'waiting' || claimedExecution.disposition === 'terminal') {
+  return;
+}
+if (claimedExecution.disposition === 'joined') {
+  return claimedExecution.completion;
+}
+if (claimedExecution.disposition === 'reused') {
+  return agent.cluster.workflowRuntime.redriveClaimedResult(claimedExecution);
+}
+
+// Only `claimed` reaches operation or terminal-coordinator code.
 const terminalClaim =
   descriptor.terminalOnSuccess === 'after_artifact_commit'
     ? await agent.cluster.terminalCoordinator.begin(
@@ -648,15 +727,18 @@ const disposition = await executeWorkflowOperation(
   },
   {
     executionKey: claimedExecution.executionKey,
+    executionEpoch: claimedExecution.executionEpoch,
+    ownerToken: claimedExecution.ownerToken,
     publishIfAbsent: agent.messageBus.publishIfAbsent.bind(agent.messageBus),
   }
 );
 ```
 
 Do not separately call the void `agent._publish`. Descriptor-owned routing and
-subscriber emission live inside the publication boundary above. A readiness
-result of `waiting` returns idle before execution. Only a claimed final-artifact
-operation calls `begin`; its deadline covers a hanging operation. A claimed
+subscriber emission live inside the publication boundary above. Branch on the
+claim disposition immediately: `waiting` and `terminal` return, `joined` awaits
+the live owner, and `reused` returns or re-drives its stored outbox result. Only
+a `claimed` final-artifact operation calls `begin`; its deadline covers a hanging operation. A claimed
 nonterminal operation records completion/failure in its workflow-state key and
 returns to ordinary workflow progress without terminalization. Report final
 success/failure/cancellation through the shared coordinator. Add an integration
@@ -667,10 +749,18 @@ delivery emits once to both generic and topic subscribers, and a never-settling
 operation reaches one deadline failure.
 
 For a final operation, require `terminalClaim.executionKey ===
-claimedExecution.executionKey` and execute only `claimed`/valid `reused`
-dispositions; `terminal` returns without work. Deadline/cancellation must abort
-the exact signal passed above. A late result after abort cannot publish an
-artifact or mutate terminal state.
+claimedExecution.executionKey` and execute only the new `claimed` disposition.
+`joined` awaits the current in-process owner; `reused` returns/re-drives the
+durable result; `terminal` returns without work. None invokes operation code.
+Deadline/cancellation must abort the exact signal passed above. Publication and
+the durable result/outbox transaction require the current execution epoch and
+owner token, so a late result after abort cannot publish an artifact or mutate
+terminal state.
+
+Add concurrent duplicate-delivery, publish-then-crash, resume-before-deadline,
+resume-after-deadline, and late-old-owner tests. Assert one operation body runs,
+joiners observe its disposition, committed replay emits no second ordinary
+event, and only a newly fenced recovery owner can re-execute after expiry.
 
 Add `src/workflow-operations/**/*.ts` to both legacy-runtime tsconfig include
 sets and assert a clean build emits loadable adjacent JavaScript.
@@ -717,25 +807,44 @@ Include generated adjacent `.js` files only when produced by
   the synthesis request's `throughSequence`.
 - Produces a provider-free persisted `ReviewRoundCoordinator`. Each expected
   analyst must emit a schema-checked round-complete envelope even for zero
-  findings. The coordinator waits for the sealed descriptor's analyst set and
-  any validators required by their findings, freezes one `throughSequence`, and
-  compare-and-set claims the round-scoped execution key. It then emits exactly
-  one host-owned `REVIEW_ROUND_READY`; model messages cannot assert readiness.
+  findings. Every finding requires the complete validator set from the sealed
+  descriptor; envelopes may repeat that set only as a checked assertion, never
+  choose per-finding membership. Analyst completion first freezes the candidate
+  set; zero findings closes without waiting for validators. Otherwise the
+  coordinator persists an absolute round deadline and terminal
+  `completed`/`failed`/`timed_out` state for every required participant, freezes
+  one `throughSequence`, and compare-and-set claims the round-scoped transition.
+  Missing or failed participation becomes a contested outcome at the deadline.
+  Rounds are one-based. Below sealed `maxIterations`, contested
+  work emits exactly one host-owned `REVIEW_REFINEMENT_READY`; a resolved round
+  or the cap emits exactly one host-owned `REVIEW_ROUND_READY`. Model messages
+  cannot assert either readiness transition.
 
 Register this reducer with `WorkflowRuntime`. It consumes only validated durable
-progress messages, and uses `transitionWorkflowState` to CAS the round claim and
-insert the deterministic `REVIEW_ROUND_READY` row in one transaction. Runtime
-catch-up re-drives a committed ready row whose live delivery or operation claim
-was interrupted; the dispatcher still requires the matching durable claim.
+progress and participant-settlement messages, and uses
+`transitionWorkflowState` to close the round, CAS its claim, and insert the
+deterministic refinement-or-terminal row in one transaction. Runtime catch-up
+expires a passed absolute deadline and re-drives a committed row whose live
+delivery or operation claim was interrupted; the dispatcher still requires the
+matching durable claim.
+
+`WorkflowRuntime` is the only `REVIEW_REFINEMENT_READY` consumer. In one CAS it
+records the consumed refinement-row ID, creates round `n + 1`, and inserts the
+deterministic assignments for the same sealed analyst/validator sets and
+contested finding revisions. Duplicate delivery and resume reuse that state and
+never dispatch a second next round. This reducer transition is not an LLM or a
+registered workflow operation.
 
 - [ ] **Step 1: Add literal synthesis fixtures and failing tests**
 
-Before fixtures, pin the complete aggregation table: expected validator IDs;
+Before fixtures, pin the complete aggregation table: every finding requires all
+sealed expected validator IDs;
 one latest valid verdict per `(reviewId, round, findingId, candidateRevision,
 validatorId)` by durable sequence; stale/future rounds rejected; duplicate
 idempotency keys ignored; missing/failed validators make the finding contested;
-only the originating analyst may withdraw; any contest forces `NOT_READY`; and
-zero findings produces an explicit ready artifact without validators.
+only the originating analyst may withdraw; failed/timed-out participants close
+the round as contested; any contest forces `NOT_READY` at the cap; and zero
+findings produces an explicit ready artifact without validators.
 
 Fixtures must cover every table row, severity conflicts, zero findings,
 confirmed only, withdrawn, contested at cap, retry-duplicated validator
@@ -758,10 +867,14 @@ Separately assert the frozen descriptor owns success topic
 dispatcher integration that no success terminal precedes artifact acceptance.
 
 Add coordinator fixtures for all-zero and mixed analyst results, missing analyst
-completion, duplicate/late completions, concurrent final validator messages,
-resume before/after claim, and a new review round. Prove all triggers for one
-completed round reuse the same execution disposition and never create a second
-artifact.
+completion before and after the deadline, provider failure, duplicate/late
+completions, concurrent final validator messages, contested refinement below
+cap, contested terminalization at cap, resume before/after deadline and claim,
+and a new review round. Prove all triggers for one closed round reuse the same
+transition disposition, below-cap contests do not invoke synthesis, and no
+terminal round creates a second artifact. Add `maxIterations: 1` and `3`
+boundary fixtures proving one-based caps, plus a zero-finding fixture proving
+no validator deadline or assignment is created.
 
 - [ ] **Step 2: Run and verify the operation is missing**
 
